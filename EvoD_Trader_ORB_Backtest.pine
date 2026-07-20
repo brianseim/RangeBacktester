@@ -1,0 +1,838 @@
+//@version=6
+indicator("EvoD Trader ORB Backtest with Alerts", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================
+// SCRIPT 3 — ES Opening Range: 8:45 AM – 9:45 AM ET
+// S1 (breakout) and S2 (retest) entries 9:45–10:30, exit 12:00
+// S1 and S2 run independently. One S1 + one S2 per day.
+// Date Range: June 1, 2025 – June 22, 2026
+//
+// OUTCOME MODEL — exclusive buckets, sum to 100%:
+//   STOP / 50% / 100% / 200% / FLAT WIN / FLAT LOSS
+//   Furthest target reached wins. Touch 50% then stop = 50% (win).
+//   FLAT = timed out at noon w/o reaching 50% or stopping; win/loss by close vs entry.
+//   WIN = 50%+100%+200%+FlatWin.  LOSS = Stop + FlatLoss.
+//
+// STOP = 5-min CLOSE below (body low - ATR14*mult) long / above (body high + ATR14*mult) short
+// ============================================================
+
+// ------------------------------------------------------------
+// INPUTS
+// ------------------------------------------------------------
+// --- Backtest date range ---
+startDate        = input.time(timestamp("2025-06-01 00:00:00"), "Start Date",  group="Date Range")
+endDate          = input.time(timestamp("2026-06-22 23:59:59"), "End Date",    group="Date Range")
+
+// --- Session timezone ---
+tz               = input.string("America/Chicago", "TZ (Chicago=CT)", options=["America/Chicago","America/New_York","America/Los_Angeles","Europe/London","UTC"], group="Session (only used when Preset = Custom)", tooltip="America/Chicago = Central Time. Change to match your local timezone.")
+
+// --- Time-of-day windows (HHMM, 24h, in the timezone above) ---
+rangeStartHM     = input.int(845,  "Range build START (HHMM)",  group="Session (only used when Preset = Custom)")
+rangeEndHM       = input.int(945,  "Range build END (HHMM)",    group="Session")
+entryStartHM     = input.int(945,  "Entry window START (HHMM)", group="Session (only used when Preset = Custom)")
+entryEndHM       = input.int(1030, "Entry window END (HHMM)",   group="Session")
+exitHM           = input.int(1200, "Timeout EXIT (HHMM)",       group="Session")
+
+// --- Stop / risk ---
+atrLen           = input.int(14, "ATR length", minval=1, group="Risk")
+atrMult          = input.float(1.0, "ATR stop buffer multiplier", minval=0.0, step=0.1, group="Risk")
+
+// --- Holiday exclusion ---
+useHolidays      = input.bool(true, "Exclude US holidays (hardcoded list)", group="Filters")
+
+// --- Display ---
+// --- PRESET SELECTOR ---
+preset = input.string("Opening Range 745-845", "Strategy Preset",
+     options=["Opening Range 745-845", "IB First Hour 930-1030", "Custom"],
+     group="Preset", tooltip="Switching preset overrides Session times below when not Custom.")
+
+// Compute effective session times from preset
+_rangeStartHM = preset == "Opening Range 745-845" ? 745  : preset == "IB First Hour 930-1030" ? 930  : rangeStartHM
+_rangeEndHM   = preset == "Opening Range 745-845" ? 845  : preset == "IB First Hour 930-1030" ? 1030 : rangeEndHM
+_entryStartHM = preset == "Opening Range 745-845" ? 845  : preset == "IB First Hour 930-1030" ? 1030 : entryStartHM
+_entryEndHM   = preset == "Opening Range 745-845" ? 930  : preset == "IB First Hour 930-1030" ? 1600 : entryEndHM
+_exitHM       = preset == "Opening Range 745-845" ? 1200 : preset == "IB First Hour 930-1030" ? 1600 : exitHM
+
+show_range_lines = input.bool(true, "Show Range Lines + Zones", group="Display")
+show_labels      = input.bool(true, "Show Signal Labels",         group="Display")
+show_ext_labels  = input.bool(true, "Show Extension Labels (50/100/200%)", group="Display")
+recent_only      = input.bool(true, "Range lines: recent N days only", group="Display")
+recent_days      = input.int(20, "How many recent days", minval=1, maxval=250, group="Display")
+range_col        = input.color(color.new(color.orange, 80), "Range zone color",      group="Display")
+entry_col        = input.color(color.new(color.blue,   88), "Entry zone color",       group="Display")
+
+// --- Alerts (per setup; fire on confirmed bar close) ---
+alert_s1         = input.bool(true,  "Alert: S1 breakout entries",       group="Alerts")
+alert_s2         = input.bool(true,  "Alert: S2 retest entries",         group="Alerts")
+alert_fa         = input.bool(true,  "Alert: Failed-Auction reversals",  group="Alerts")
+
+// Convert HHMM inputs to minutes-since-midnight
+hm2min(hm) => math.floor(hm / 100) * 60 + (hm % 100)
+rangeStartM = hm2min(_rangeStartHM)
+rangeEndM   = hm2min(_rangeEndHM)
+entryStartM = hm2min(_entryStartHM)
+entryEndM   = hm2min(_entryEndHM)
+exitM       = hm2min(_exitHM)
+
+// ------------------------------------------------------------
+// HOLIDAY EXCLUSION — US federal holidays
+// ------------------------------------------------------------
+_hm = month(time, tz)
+_hd = dayofmonth(time, tz)
+_hy = year(time, tz)
+_ha = _hy==2025 and _hm==7  and _hd==4
+_hb = _hy==2025 and _hm==9  and _hd==1
+_hc = _hy==2025 and _hm==11 and _hd==11
+_hdd = _hy==2025 and _hm==11 and _hd==27
+_he = _hy==2025 and _hm==11 and _hd==28
+_hf = _hy==2025 and _hm==12 and _hd==25
+_hg = _hy==2025 and _hm==12 and _hd==26
+_hh = _hy==2026 and _hm==1  and _hd==1
+_hi = _hy==2026 and _hm==1  and _hd==19
+_hj = _hy==2026 and _hm==2  and _hd==16
+_hk = _hy==2026 and _hm==4  and _hd==3
+_hl = _hy==2026 and _hm==5  and _hd==25
+isHol = useHolidays and (_ha or _hb or _hc or _hdd or _he or _hf or _hg or _hh or _hi or _hj or _hk or _hl)
+
+// ------------------------------------------------------------
+// SESSION HELPERS
+// ------------------------------------------------------------
+barHour        = hour(time, tz)
+barMinute      = minute(time, tz)
+barTimeMinutes = barHour * 60 + barMinute
+
+inRange   = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM   // range build
+s1Window  = barTimeMinutes >= entryStartM and barTimeMinutes < entryEndM   // S1 entries
+s2Window  = barTimeMinutes >= entryStartM and barTimeMinutes < entryEndM   // S2 entries
+exitMin   = exitM                                                          // timeout exit
+inDateRange = time >= startDate and time <= endDate
+validDay    = inDateRange and not isHol
+
+dw     = dayofweek(time, tz)
+dowNow = dw == dayofweek.monday ? 0 : dw == dayofweek.tuesday ? 1 : dw == dayofweek.wednesday ? 2 : dw == dayofweek.thursday ? 3 : 4
+
+atr14 = ta.atr(atrLen)
+
+// ------------------------------------------------------------
+// RANGE CALCULATION
+// ------------------------------------------------------------
+var float orHigh      = na
+var float orLow       = na
+var bool  rangeSet    = false
+var int   rangeStartT = na
+
+isFirstRangeBar = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM and (barTimeMinutes[1] < rangeStartM or barTimeMinutes[1] >= rangeEndM)
+
+if isFirstRangeBar
+    orHigh      := high
+    orLow       := low
+    rangeSet    := false
+    rangeStartT := time
+
+if inRange and not na(orHigh)
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow,  low)
+
+if barTimeMinutes >= rangeEndM and barTimeMinutes < entryEndM and barTimeMinutes[1] < rangeEndM
+    rangeSet := true
+
+rangeHeight = not na(orHigh) and not na(orLow) ? orHigh - orLow : na
+
+// ------------------------------------------------------------
+// RANGE LINES (time-anchored, recent-N-days pruned)
+// ------------------------------------------------------------
+// Range lines + filled zone rectangles
+var line[] rangeLines = array.new_line()
+var box[]  rangeBoxes = array.new_box()
+
+if rangeSet and show_range_lines and validDay and barTimeMinutes >= rangeEndM and barTimeMinutes[1] < rangeEndM
+    // Time anchors
+    rStartT   = rangeStartT
+    rangeEndT = time
+    entryEndT = time + math.max(entryEndM - rangeEndM, 30) * 60 * 1000
+
+    // Boundary lines at range high/low extending through entry window
+    lh = line.new(time, orHigh, entryEndT, orHigh, xloc=xloc.bar_time, color=color.new(color.orange, 20), width=2, style=line.style_solid)
+    ll = line.new(time, orLow,  entryEndT, orLow,  xloc=xloc.bar_time, color=color.new(color.orange, 20), width=2, style=line.style_solid)
+    array.push(rangeLines, lh)
+    array.push(rangeLines, ll)
+
+    // Filled rectangle: range BUILD period (darker fill)
+    bRange = box.new(rStartT, orHigh, rangeEndT, orLow,
+         xloc=xloc.bar_time,
+         border_color=color.new(color.orange, 40),
+         border_width=1,
+         bgcolor=range_col)
+    array.push(rangeBoxes, bRange)
+
+    // Filled rectangle: ENTRY window (lighter fill)
+    bEntry = box.new(rangeEndT, orHigh, entryEndT, orLow,
+         xloc=xloc.bar_time,
+         border_color=color.new(color.blue, 50),
+         border_width=1,
+         bgcolor=entry_col)
+    array.push(rangeBoxes, bEntry)
+
+    // ── Internal range splits (25%, 50%, 75%) ──────────────
+    rng  = orHigh - orLow
+    mid  = orLow + rng * 0.50
+    q1   = orLow + rng * 0.25
+    q3   = orLow + rng * 0.75
+
+    splitLevels = array.from(q1, mid, q3)
+    for si = 0 to 2
+        sLvl = array.get(splitLevels, si)
+        splitLine = line.new(rStartT, sLvl, entryEndT, sLvl,
+             xloc=xloc.bar_time,
+             color=color.new(color.orange, 55),
+             width=1,
+             style=line.style_dashed)
+        array.push(rangeLines, splitLine)
+
+    // ── Extensions above/below range (50%, 100%, 200%) ───────
+    extMults  = array.new_float(3)
+    array.set(extMults, 0, 0.5)
+    array.set(extMults, 1, 1.0)
+    array.set(extMults, 2, 2.0)
+    extLabels = array.new_string(3)
+    array.set(extLabels, 0, "50%")
+    array.set(extLabels, 1, "100%")
+    array.set(extLabels, 2, "200%")
+
+    for i = 0 to 2
+        mult  = array.get(extMults, i)
+        elbl  = array.get(extLabels, i)
+        ecol  = i < 2 ? color.new(color.lime, 40 - i * 15) : color.new(color.aqua, 20)
+        lvlUp = orHigh + rng * mult
+        lvlDn = orLow  - rng * mult
+
+        // Long extension (above high)
+        extUp = line.new(rangeEndT, lvlUp, entryEndT, lvlUp,
+             xloc=xloc.bar_time,
+             color=ecol, width=1, style=line.style_dashed)
+        array.push(rangeLines, extUp)
+
+        // Short extension (below low)
+        extDn = line.new(rangeEndT, lvlDn, entryEndT, lvlDn,
+             xloc=xloc.bar_time,
+             color=ecol, width=1, style=line.style_dashed)
+        array.push(rangeLines, extDn)
+
+        // Labels at right edge (optional)
+        if show_ext_labels
+            label.new(entryEndT, lvlUp, xloc=xloc.bar_time,
+                 text=elbl, style=label.style_label_left,
+                 color=color.new(ecol, 20),
+                 textcolor=color.white, size=size.tiny)
+            label.new(entryEndT, lvlDn, xloc=xloc.bar_time,
+                 text=elbl, style=label.style_label_left,
+                 color=color.new(ecol, 20),
+                 textcolor=color.white, size=size.tiny)
+
+    // Active config label on the range box (shows true active times)
+    if barstate.isconfirmed
+        label.new(rangeEndT, orHigh, xloc=xloc.bar_time,
+             text=str.tostring(_rangeStartHM) + "-" + str.tostring(_rangeEndHM) + " | E:" + str.tostring(_entryStartHM) + "-" + str.tostring(_entryEndHM),
+             style=label.style_label_lower_left,
+             color=color.new(color.gray, 70),
+             textcolor=color.new(color.white, 20),
+             size=size.tiny)
+
+    // Prune old objects
+    maxObjs = recent_only ? recent_days : 100000
+    while array.size(rangeLines) > maxObjs * 12
+        line.delete(array.shift(rangeLines))
+    while array.size(rangeBoxes) > maxObjs * 2
+        box.delete(array.shift(rangeBoxes))
+
+// ------------------------------------------------------------
+// EXCLUSIVE OUTCOME COUNTERS
+// ------------------------------------------------------------
+var int s1l_tot=0
+var int s1l_stop=0
+var int s1l_t50=0
+var int s1l_t100=0
+var int s1l_t200=0
+var int s1l_fw=0
+var int s1l_fl=0
+var int s1s_tot=0
+var int s1s_stop=0
+var int s1s_t50=0
+var int s1s_t100=0
+var int s1s_t200=0
+var int s1s_fw=0
+var int s1s_fl=0
+var int s2l_tot=0
+var int s2l_stop=0
+var int s2l_t50=0
+var int s2l_t100=0
+var int s2l_t200=0
+var int s2l_fw=0
+var int s2l_fl=0
+var int s2s_tot=0
+var int s2s_stop=0
+var int s2s_t50=0
+var int s2s_t100=0
+var int s2s_t200=0
+var int s2s_fw=0
+var int s2s_fl=0
+
+var dow_sig  = array.new_int(5, 0)
+var dow_lsig = array.new_int(5, 0)
+var dow_ssig = array.new_int(5, 0)
+var dow_stop = array.new_int(5, 0)
+var dow_t50  = array.new_int(5, 0)
+var dow_t100 = array.new_int(5, 0)
+var dow_t200 = array.new_int(5, 0)
+var dow_fw   = array.new_int(5, 0)
+var dow_fl   = array.new_int(5, 0)
+
+// ------------------------------------------------------------
+// SHARED BREAKOUT STATE (drives both S1 entry and S2 retests)
+// ------------------------------------------------------------
+var bool  s1_done      = false
+var bool  s2_done      = false
+var bool  breakoutUp   = false
+var bool  breakoutDown = false
+var float breakoutLevel= na
+// Failed-auction reversal state
+var bool  fa_armed     = false   // an S1 stopped out; watch opposite edge
+var bool  fa_longFail  = false   // the failed breakout was a LONG (so reversal=short)
+var bool  fa_done      = false   // reversal already taken (one per day)
+
+// ------------------------------------------------------------
+// S1 (BREAKOUT) POSITION STATE
+// ------------------------------------------------------------
+var bool  a1_in    = false
+var bool  a1_long  = false
+var float a1_stop  = na
+var float a1_t50   = na
+var float a1_t100  = na
+var float a1_t200  = na
+var float a1_entry = na
+var bool  a1_h50   = false
+var bool  a1_h100  = false
+var bool  a1_h200  = false
+var int   a1_dow   = 0
+var int   a1_ebar  = na
+
+// ------------------------------------------------------------
+// S2 (RETEST) POSITION STATE
+// ------------------------------------------------------------
+var bool  a2_in    = false
+var bool  a2_long  = false
+var float a2_stop  = na
+var float a2_t50   = na
+var float a2_t100  = na
+var float a2_t200  = na
+var float a2_entry = na
+var bool  a2_h50   = false
+var bool  a2_h100  = false
+var bool  a2_h200  = false
+var int   a2_dow   = 0
+var int   a2_ebar  = na
+
+// Daily reset
+if isFirstRangeBar
+    a1_in := false
+    a2_in := false
+if barTimeMinutes >= rangeEndM and barTimeMinutes[1] < rangeEndM
+    s1_done       := false
+    s2_done       := false
+    breakoutUp    := false
+    breakoutDown  := false
+    breakoutLevel := na
+    fa_armed      := false
+    fa_longFail   := false
+    fa_done       := false
+
+// ============================================================
+// HELPER: outcome code from hit flags (furthest reached wins)
+//   used inline; 0=stop 1=t50 2=t100 3=t200 4=flatWin 5=flatLoss
+// ============================================================
+
+// ------------------------------------------------------------
+// S1 RESOLUTION
+// ------------------------------------------------------------
+a1_out = -1
+if a1_in and validDay and bar_index > a1_ebar
+    if a1_long
+        if high >= a1_t50  and not a1_h50
+            a1_h50  := true
+        if high >= a1_t100 and not a1_h100
+            a1_h100 := true
+        if high >= a1_t200 and not a1_h200
+            a1_h200 := true
+        if close < a1_stop
+            a1_out := a1_h200 ? 3 : a1_h100 ? 2 : a1_h50 ? 1 : 0
+    else
+        if low <= a1_t50  and not a1_h50
+            a1_h50  := true
+        if low <= a1_t100 and not a1_h100
+            a1_h100 := true
+        if low <= a1_t200 and not a1_h200
+            a1_h200 := true
+        if close > a1_stop
+            a1_out := a1_h200 ? 3 : a1_h100 ? 2 : a1_h50 ? 1 : 0
+
+if barTimeMinutes >= exitMin and barTimeMinutes[1] < exitMin and a1_in and validDay and a1_out == -1
+    fw = a1_long ? (close > a1_entry) : (close < a1_entry)
+    a1_out := a1_h200 ? 3 : a1_h100 ? 2 : a1_h50 ? 1 : (fw ? 4 : 5)
+
+// Record S1 outcome
+if a1_out >= 0
+    if show_labels
+        oTxt = a1_out==0 ? "STOP" : a1_out==1 ? "50%" : a1_out==2 ? "100%" : a1_out==3 ? "200%" : a1_out==4 ? "TO+" : "TO-"
+        oCol = a1_out==0 ? color.red : a1_out==3 ? color.aqua : (a1_out==1 or a1_out==2) ? color.lime : a1_out==4 ? color.teal : color.gray
+        label.new(time, a1_long ? high : low, xloc=xloc.bar_time, text=oTxt, style=a1_long ? label.style_label_down : label.style_label_up, color=color.new(oCol, 30), textcolor=color.white, size=size.tiny)
+    if a1_long
+        s1l_tot += 1
+        if a1_out==0
+            s1l_stop += 1
+        if a1_out==1
+            s1l_t50 += 1
+        if a1_out==2
+            s1l_t100 += 1
+        if a1_out==3
+            s1l_t200 += 1
+        if a1_out==4
+            s1l_fw += 1
+        if a1_out==5
+            s1l_fl += 1
+        array.set(dow_lsig, a1_dow, array.get(dow_lsig, a1_dow) + 1)
+    else
+        s1s_tot += 1
+        if a1_out==0
+            s1s_stop += 1
+        if a1_out==1
+            s1s_t50 += 1
+        if a1_out==2
+            s1s_t100 += 1
+        if a1_out==3
+            s1s_t200 += 1
+        if a1_out==4
+            s1s_fw += 1
+        if a1_out==5
+            s1s_fl += 1
+        array.set(dow_ssig, a1_dow, array.get(dow_ssig, a1_dow) + 1)
+    array.set(dow_sig, a1_dow, array.get(dow_sig, a1_dow) + 1)
+    if a1_out==0
+        array.set(dow_stop, a1_dow, array.get(dow_stop, a1_dow) + 1)
+    if a1_out==1
+        array.set(dow_t50, a1_dow, array.get(dow_t50, a1_dow) + 1)
+    if a1_out==2
+        array.set(dow_t100, a1_dow, array.get(dow_t100, a1_dow) + 1)
+    if a1_out==3
+        array.set(dow_t200, a1_dow, array.get(dow_t200, a1_dow) + 1)
+    if a1_out==4
+        array.set(dow_fw, a1_dow, array.get(dow_fw, a1_dow) + 1)
+    if a1_out==5
+        array.set(dow_fl, a1_dow, array.get(dow_fl, a1_dow) + 1)
+    // Arm failed-auction reversal if this S1 STOPPED OUT (not a target/flat)
+    if a1_out == 0 and not fa_done
+        fa_armed    := true
+        fa_longFail := a1_long
+    a1_in := false
+
+// ------------------------------------------------------------
+// S2 RESOLUTION
+// ------------------------------------------------------------
+a2_out = -1
+if a2_in and validDay and bar_index > a2_ebar
+    if a2_long
+        if high >= a2_t50  and not a2_h50
+            a2_h50  := true
+        if high >= a2_t100 and not a2_h100
+            a2_h100 := true
+        if high >= a2_t200 and not a2_h200
+            a2_h200 := true
+        if close < a2_stop
+            a2_out := a2_h200 ? 3 : a2_h100 ? 2 : a2_h50 ? 1 : 0
+    else
+        if low <= a2_t50  and not a2_h50
+            a2_h50  := true
+        if low <= a2_t100 and not a2_h100
+            a2_h100 := true
+        if low <= a2_t200 and not a2_h200
+            a2_h200 := true
+        if close > a2_stop
+            a2_out := a2_h200 ? 3 : a2_h100 ? 2 : a2_h50 ? 1 : 0
+
+if barTimeMinutes >= exitMin and barTimeMinutes[1] < exitMin and a2_in and validDay and a2_out == -1
+    fw2 = a2_long ? (close > a2_entry) : (close < a2_entry)
+    a2_out := a2_h200 ? 3 : a2_h100 ? 2 : a2_h50 ? 1 : (fw2 ? 4 : 5)
+
+// Record S2 outcome
+if a2_out >= 0
+    if show_labels
+        oTxt2 = a2_out==0 ? "STOP" : a2_out==1 ? "50%" : a2_out==2 ? "100%" : a2_out==3 ? "200%" : a2_out==4 ? "TO+" : "TO-"
+        oCol2 = a2_out==0 ? color.red : a2_out==3 ? color.aqua : (a2_out==1 or a2_out==2) ? color.lime : a2_out==4 ? color.teal : color.gray
+        label.new(time, a2_long ? high : low, xloc=xloc.bar_time, text="R:" + oTxt2, style=a2_long ? label.style_label_down : label.style_label_up, color=color.new(oCol2, 50), textcolor=color.white, size=size.tiny)
+    if a2_long
+        s2l_tot += 1
+        if a2_out==0
+            s2l_stop += 1
+        if a2_out==1
+            s2l_t50 += 1
+        if a2_out==2
+            s2l_t100 += 1
+        if a2_out==3
+            s2l_t200 += 1
+        if a2_out==4
+            s2l_fw += 1
+        if a2_out==5
+            s2l_fl += 1
+        array.set(dow_lsig, a2_dow, array.get(dow_lsig, a2_dow) + 1)
+    else
+        s2s_tot += 1
+        if a2_out==0
+            s2s_stop += 1
+        if a2_out==1
+            s2s_t50 += 1
+        if a2_out==2
+            s2s_t100 += 1
+        if a2_out==3
+            s2s_t200 += 1
+        if a2_out==4
+            s2s_fw += 1
+        if a2_out==5
+            s2s_fl += 1
+        array.set(dow_ssig, a2_dow, array.get(dow_ssig, a2_dow) + 1)
+    array.set(dow_sig, a2_dow, array.get(dow_sig, a2_dow) + 1)
+    if a2_out==0
+        array.set(dow_stop, a2_dow, array.get(dow_stop, a2_dow) + 1)
+    if a2_out==1
+        array.set(dow_t50, a2_dow, array.get(dow_t50, a2_dow) + 1)
+    if a2_out==2
+        array.set(dow_t100, a2_dow, array.get(dow_t100, a2_dow) + 1)
+    if a2_out==3
+        array.set(dow_t200, a2_dow, array.get(dow_t200, a2_dow) + 1)
+    if a2_out==4
+        array.set(dow_fw, a2_dow, array.get(dow_fw, a2_dow) + 1)
+    if a2_out==5
+        array.set(dow_fl, a2_dow, array.get(dow_fl, a2_dow) + 1)
+    a2_in := false
+
+// ------------------------------------------------------------
+// SETUP 1 — Initial Breakout (entries 9:45–10:30)
+// ------------------------------------------------------------
+if rangeSet and s1Window and not s1_done and not a1_in and validDay and not na(rangeHeight)
+    rng = rangeHeight
+    if close > orHigh
+        s1_done       := true
+        breakoutUp    := true
+        breakoutLevel := orHigh
+        a1_in    := true
+        a1_long  := true
+        a1_stop  := math.min(open, close) - atr14 * atrMult
+        a1_t50   := close + rng * 0.5
+        a1_t100  := close + rng * 1.0
+        a1_t200  := close + rng * 2.0
+        a1_entry := close
+        a1_h50   := false
+        a1_h100  := false
+        a1_h200  := false
+        a1_dow   := dowNow
+        a1_ebar  := bar_index
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="S1L\n" + str.tostring(close, "#.##"), style=label.style_label_up, color=color.new(color.green,20), textcolor=color.white, size=size.small)
+        if alert_s1
+            alert("S1 LONG breakout entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    else if close < orLow
+        s1_done       := true
+        breakoutDown  := true
+        breakoutLevel := orLow
+        a1_in    := true
+        a1_long  := false
+        a1_stop  := math.max(open, close) + atr14 * atrMult
+        a1_t50   := close - rng * 0.5
+        a1_t100  := close - rng * 1.0
+        a1_t200  := close - rng * 2.0
+        a1_entry := close
+        a1_h50   := false
+        a1_h100  := false
+        a1_h200  := false
+        a1_dow   := dowNow
+        a1_ebar  := bar_index
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="S1S\n" + str.tostring(close, "#.##"), style=label.style_label_down, color=color.new(color.red,20), textcolor=color.white, size=size.small)
+        if alert_s1
+            alert("S1 SHORT breakout entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ------------------------------------------------------------
+// FAILED-AUCTION REVERSAL — after an S1 stop, take the opposite edge break
+// Tracked as a NEW S1 entry (opposite direction). Same 9:45–10:30 window.
+// ------------------------------------------------------------
+if rangeSet and s1Window and fa_armed and not fa_done and not a1_in and validDay and not na(rangeHeight)
+    rng = rangeHeight
+    // failed LONG -> reversal SHORT on close below lower edge
+    if fa_longFail and close < orLow
+        fa_done  := true
+        a1_in    := true
+        a1_long  := false
+        a1_stop  := math.max(open, close) + atr14 * atrMult
+        a1_t50   := close - rng * 0.5
+        a1_t100  := close - rng * 1.0
+        a1_t200  := close - rng * 2.0
+        a1_entry := close
+        a1_h50   := false
+        a1_h100  := false
+        a1_h200  := false
+        a1_dow   := dowNow
+        a1_ebar  := bar_index
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="FA-S\n" + str.tostring(close, "#.##"), style=label.style_label_down, color=color.new(color.fuchsia,20), textcolor=color.white, size=size.small)
+        if alert_fa
+            alert("Failed-Auction SHORT entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    // failed SHORT -> reversal LONG on close above upper edge
+    else if (not fa_longFail) and close > orHigh
+        fa_done  := true
+        a1_in    := true
+        a1_long  := true
+        a1_stop  := math.min(open, close) - atr14 * atrMult
+        a1_t50   := close + rng * 0.5
+        a1_t100  := close + rng * 1.0
+        a1_t200  := close + rng * 2.0
+        a1_entry := close
+        a1_h50   := false
+        a1_h100  := false
+        a1_h200  := false
+        a1_dow   := dowNow
+        a1_ebar  := bar_index
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="FA-L\n" + str.tostring(close, "#.##"), style=label.style_label_up, color=color.new(color.fuchsia,20), textcolor=color.white, size=size.small)
+        if alert_fa
+            alert("Failed-Auction LONG entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ------------------------------------------------------------
+// SETUP 2 — Wick Retest (entries 9:45–11:00, INDEPENDENT of S1)
+// ------------------------------------------------------------
+if rangeSet and s2Window and not s2_done and not a2_in and validDay and not na(rangeHeight)
+    rng = rangeHeight
+    if breakoutUp and not na(breakoutLevel)
+        rA = breakoutLevel
+        rB = breakoutLevel + rng * 0.5
+        rC = breakoutLevel + rng * 1.0
+        // Valid LONG retest: prior bar closed ABOVE level (in profit),
+        // this bar wicks DOWN to level, then closes back ABOVE (rejection)
+        wA = close[1] > rA and low <= rA and close > rA
+        wB = close[1] > rB and low <= rB and close > rB
+        wC = close[1] > rC and low <= rC and close > rC
+        if wA or wB or wC
+            s2_done  := true
+            a2_in    := true
+            a2_long  := true
+            a2_stop  := math.min(open, close) - atr14 * atrMult
+            a2_t50   := close + rng * 0.5
+            a2_t100  := close + rng * 1.0
+            a2_t200  := close + rng * 2.0
+            a2_entry := close
+            a2_h50   := false
+            a2_h100  := false
+            a2_h200  := false
+            a2_dow   := dowNow
+            a2_ebar  := bar_index
+            lvl = wA ? "A" : wB ? "B" : "C"
+            if show_labels
+                label.new(time, low, xloc=xloc.bar_time, text="S2L-" + lvl + "\n" + str.tostring(close, "#.##"), style=label.style_label_up, color=color.new(color.green,20), textcolor=color.white, size=size.small)
+            if alert_s2
+                alert("S2 LONG retest entry (" + lvl + ") @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    else if breakoutDown and not na(breakoutLevel)
+        rA = breakoutLevel
+        rB = breakoutLevel - rng * 0.5
+        rC = breakoutLevel - rng * 1.0
+        // Valid SHORT retest: prior bar closed BELOW level (in profit),
+        // this bar wicks UP to level, then closes back BELOW (rejection)
+        wA = close[1] < rA and high >= rA and close < rA
+        wB = close[1] < rB and high >= rB and close < rB
+        wC = close[1] < rC and high >= rC and close < rC
+        if wA or wB or wC
+            s2_done  := true
+            a2_in    := true
+            a2_long  := false
+            a2_stop  := math.max(open, close) + atr14 * atrMult
+            a2_t50   := close - rng * 0.5
+            a2_t100  := close - rng * 1.0
+            a2_t200  := close - rng * 2.0
+            a2_entry := close
+            a2_h50   := false
+            a2_h100  := false
+            a2_h200  := false
+            a2_dow   := dowNow
+            a2_ebar  := bar_index
+            lvl = wA ? "A" : wB ? "B" : "C"
+            if show_labels
+                label.new(time, high, xloc=xloc.bar_time, text="S2S-" + lvl + "\n" + str.tostring(close, "#.##"), style=label.style_label_down, color=color.new(color.red,20), textcolor=color.white, size=size.small)
+            if alert_s2
+                alert("S2 SHORT retest entry (" + lvl + ") @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ------------------------------------------------------------
+// TABLES
+// Order: Signals | Stop | Flat Loss | LOSS RATE | Flat Win | 50% | 100% | 200% | WIN RATE
+// Target rows are CUMULATIVE (reached at least X%). 100/200 nest inside 50%.
+// WIN RATE = Flat Win + (reached >=50%).  LOSS RATE = Stop + Flat Loss.
+// ------------------------------------------------------------
+pct(n, d) => d > 0 ? str.tostring(math.round(n / d * 100)) + "%" : "—"
+
+var table t1 = table.new(position.top_right, 5, 11, bgcolor=color.new(color.black,10), border_color=color.gray, border_width=1, frame_color=color.gray, frame_width=1)
+var table t2 = table.new(position.bottom_right, 7, 12, bgcolor=color.new(color.black,10), border_color=color.gray, border_width=1, frame_color=color.gray, frame_width=1)
+
+if barstate.islast
+    // Cumulative + subtotal calcs per stream
+    s1l_c50 = s1l_t50 + s1l_t100 + s1l_t200
+    s1l_c100 = s1l_t100 + s1l_t200
+    s1l_loss = s1l_stop + s1l_fl
+    s1l_win  = s1l_fw + s1l_c50
+    s1s_c50 = s1s_t50 + s1s_t100 + s1s_t200
+    s1s_c100 = s1s_t100 + s1s_t200
+    s1s_loss = s1s_stop + s1s_fl
+    s1s_win  = s1s_fw + s1s_c50
+    s2l_c50 = s2l_t50 + s2l_t100 + s2l_t200
+    s2l_c100 = s2l_t100 + s2l_t200
+    s2l_loss = s2l_stop + s2l_fl
+    s2l_win  = s2l_fw + s2l_c50
+    s2s_c50 = s2s_t50 + s2s_t100 + s2s_t200
+    s2s_c100 = s2s_t100 + s2s_t200
+    s2s_loss = s2s_stop + s2s_fl
+    s2s_win  = s2s_fw + s2s_c50
+
+    hc = color.new(color.maroon, 20)
+    table.cell(t1,0,0,"METRIC",   text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t1,1,0,"S1 LONG",  text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t1,2,0,"S1 SHORT", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t1,3,0,"S2 LONG",  text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t1,4,0,"S2 SHORT", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+
+    table.cell(t1,0,1,"Signals",  text_color=color.white, text_size=size.small)
+    table.cell(t1,1,1,str.tostring(s1l_tot), text_color=color.white, text_size=size.small)
+    table.cell(t1,2,1,str.tostring(s1s_tot), text_color=color.white, text_size=size.small)
+    table.cell(t1,3,1,str.tostring(s2l_tot), text_color=color.white, text_size=size.small)
+    table.cell(t1,4,1,str.tostring(s2s_tot), text_color=color.white, text_size=size.small)
+
+    table.cell(t1,0,2,"Stop", text_color=color.red, text_size=size.small)
+    table.cell(t1,1,2,pct(s1l_stop,s1l_tot), text_color=color.red, text_size=size.small)
+    table.cell(t1,2,2,pct(s1s_stop,s1s_tot), text_color=color.red, text_size=size.small)
+    table.cell(t1,3,2,pct(s2l_stop,s2l_tot), text_color=color.red, text_size=size.small)
+    table.cell(t1,4,2,pct(s2s_stop,s2s_tot), text_color=color.red, text_size=size.small)
+
+    table.cell(t1,0,3,"Timeout L", text_color=color.gray, text_size=size.small)
+    table.cell(t1,1,3,pct(s1l_fl,s1l_tot), text_color=color.gray, text_size=size.small)
+    table.cell(t1,2,3,pct(s1s_fl,s1s_tot), text_color=color.gray, text_size=size.small)
+    table.cell(t1,3,3,pct(s2l_fl,s2l_tot), text_color=color.gray, text_size=size.small)
+    table.cell(t1,4,3,pct(s2s_fl,s2s_tot), text_color=color.gray, text_size=size.small)
+
+    lc = color.new(color.red, 55)
+    table.cell(t1,0,4,"LOSS RATE", text_color=color.white, text_size=size.small, bgcolor=lc)
+    table.cell(t1,1,4,pct(s1l_loss,s1l_tot), text_color=color.white, text_size=size.small, bgcolor=lc)
+    table.cell(t1,2,4,pct(s1s_loss,s1s_tot), text_color=color.white, text_size=size.small, bgcolor=lc)
+    table.cell(t1,3,4,pct(s2l_loss,s2l_tot), text_color=color.white, text_size=size.small, bgcolor=lc)
+    table.cell(t1,4,4,pct(s2s_loss,s2s_tot), text_color=color.white, text_size=size.small, bgcolor=lc)
+
+    table.cell(t1,0,5,"Timeout W", text_color=color.teal, text_size=size.small)
+    table.cell(t1,1,5,pct(s1l_fw,s1l_tot), text_color=color.teal, text_size=size.small)
+    table.cell(t1,2,5,pct(s1s_fw,s1s_tot), text_color=color.teal, text_size=size.small)
+    table.cell(t1,3,5,pct(s2l_fw,s2l_tot), text_color=color.teal, text_size=size.small)
+    table.cell(t1,4,5,pct(s2s_fw,s2s_tot), text_color=color.teal, text_size=size.small)
+
+    table.cell(t1,0,6,"50%", text_color=color.lime, text_size=size.small)
+    table.cell(t1,1,6,pct(s1l_c50,s1l_tot),  text_color=color.lime, text_size=size.small)
+    table.cell(t1,2,6,pct(s1s_c50,s1s_tot),  text_color=color.lime, text_size=size.small)
+    table.cell(t1,3,6,pct(s2l_c50,s2l_tot),  text_color=color.lime, text_size=size.small)
+    table.cell(t1,4,6,pct(s2s_c50,s2s_tot),  text_color=color.lime, text_size=size.small)
+
+    table.cell(t1,0,7,"100%", text_color=color.lime, text_size=size.small)
+    table.cell(t1,1,7,pct(s1l_c100,s1l_tot), text_color=color.lime, text_size=size.small)
+    table.cell(t1,2,7,pct(s1s_c100,s1s_tot), text_color=color.lime, text_size=size.small)
+    table.cell(t1,3,7,pct(s2l_c100,s2l_tot), text_color=color.lime, text_size=size.small)
+    table.cell(t1,4,7,pct(s2s_c100,s2s_tot), text_color=color.lime, text_size=size.small)
+
+    table.cell(t1,0,8,"200%", text_color=color.aqua, text_size=size.small)
+    table.cell(t1,1,8,pct(s1l_t200,s1l_tot), text_color=color.aqua, text_size=size.small)
+    table.cell(t1,2,8,pct(s1s_t200,s1s_tot), text_color=color.aqua, text_size=size.small)
+    table.cell(t1,3,8,pct(s2l_t200,s2l_tot), text_color=color.aqua, text_size=size.small)
+    table.cell(t1,4,8,pct(s2s_t200,s2s_tot), text_color=color.aqua, text_size=size.small)
+
+    wc = color.new(color.green, 50)
+    table.cell(t1,0,9,"WIN RATE", text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t1,1,9,pct(s1l_win,s1l_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t1,2,9,pct(s1s_win,s1s_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t1,3,9,pct(s2l_win,s2l_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t1,4,9,pct(s2s_win,s2s_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+
+    cfgTxt = "[" + preset + "]  Range " + str.tostring(_rangeStartHM) + "–" + str.tostring(_rangeEndHM) + " | Entry " + str.tostring(_entryStartHM) + "–" + str.tostring(_entryEndHM) + " | Exit " + str.tostring(_exitHM) + " (" + tz + ")"
+    table.cell(t1,0,10,cfgTxt, text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.maroon,40))
+
+    // ---- DAY OF WEEK TABLE ----
+    days = array.from("MON","TUE","WED","THU","FRI")
+    hc2  = color.new(color.maroon, 30)
+    table.cell(t2,0,0,"METRIC", text_color=color.yellow, text_size=size.small, bgcolor=hc2)
+    for i = 0 to 4
+        table.cell(t2, i+1, 0, array.get(days,i), text_color=color.yellow, text_size=size.small, bgcolor=hc2)
+    table.cell(t2,6,0,"TOTAL", text_color=color.yellow, text_size=size.small, bgcolor=hc2)
+
+    totalSig = s1l_tot + s1s_tot + s2l_tot + s2s_tot
+    table.cell(t2,0,1,"Signals", text_color=color.white, text_size=size.small)
+    for i = 0 to 4
+        table.cell(t2, i+1, 1, str.tostring(array.get(dow_sig,i)), text_color=color.white, text_size=size.small)
+    table.cell(t2,6,1,str.tostring(totalSig), text_color=color.white, text_size=size.small)
+
+    table.cell(t2,0,2,"→ Long", text_color=color.lime, text_size=size.small)
+    for i = 0 to 4
+        table.cell(t2, i+1, 2, str.tostring(array.get(dow_lsig,i)), text_color=color.lime, text_size=size.small)
+    table.cell(t2,6,2,str.tostring(s1l_tot + s2l_tot), text_color=color.lime, text_size=size.small)
+
+    table.cell(t2,0,3,"→ Short", text_color=color.red, text_size=size.small)
+    for i = 0 to 4
+        table.cell(t2, i+1, 3, str.tostring(array.get(dow_ssig,i)), text_color=color.red, text_size=size.small)
+    table.cell(t2,6,3,str.tostring(s1s_tot + s2s_tot), text_color=color.red, text_size=size.small)
+
+    table.cell(t2,0,4,"Stop", text_color=color.red, text_size=size.small)
+    for i = 0 to 4
+        table.cell(t2, i+1, 4, pct(array.get(dow_stop,i), array.get(dow_sig,i)), text_color=color.red, text_size=size.small)
+    table.cell(t2,6,4,pct(s1l_stop+s1s_stop+s2l_stop+s2s_stop, totalSig), text_color=color.red, text_size=size.small)
+
+    table.cell(t2,0,5,"Timeout L", text_color=color.gray, text_size=size.small)
+    for i = 0 to 4
+        table.cell(t2, i+1, 5, pct(array.get(dow_fl,i), array.get(dow_sig,i)), text_color=color.gray, text_size=size.small)
+    table.cell(t2,6,5,pct(s1l_fl+s1s_fl+s2l_fl+s2s_fl, totalSig), text_color=color.gray, text_size=size.small)
+
+    lc2 = color.new(color.red, 55)
+    table.cell(t2,0,6,"LOSS RATE", text_color=color.white, text_size=size.small, bgcolor=lc2)
+    for i = 0 to 4
+        dloss = array.get(dow_stop,i) + array.get(dow_fl,i)
+        table.cell(t2, i+1, 6, pct(dloss, array.get(dow_sig,i)), text_color=color.white, text_size=size.small, bgcolor=lc2)
+    table.cell(t2,6,6,pct(s1l_loss+s1s_loss+s2l_loss+s2s_loss, totalSig), text_color=color.white, text_size=size.small, bgcolor=lc2)
+
+    table.cell(t2,0,7,"Timeout W", text_color=color.teal, text_size=size.small)
+    for i = 0 to 4
+        table.cell(t2, i+1, 7, pct(array.get(dow_fw,i), array.get(dow_sig,i)), text_color=color.teal, text_size=size.small)
+    table.cell(t2,6,7,pct(s1l_fw+s1s_fw+s2l_fw+s2s_fw, totalSig), text_color=color.teal, text_size=size.small)
+
+    table.cell(t2,0,8,"50%", text_color=color.lime, text_size=size.small)
+    for i = 0 to 4
+        dc50 = array.get(dow_t50,i) + array.get(dow_t100,i) + array.get(dow_t200,i)
+        table.cell(t2, i+1, 8, pct(dc50, array.get(dow_sig,i)), text_color=color.lime, text_size=size.small)
+    table.cell(t2,6,8,pct(s1l_c50+s1s_c50+s2l_c50+s2s_c50, totalSig), text_color=color.lime, text_size=size.small)
+
+    table.cell(t2,0,9,"100%", text_color=color.lime, text_size=size.small)
+    for i = 0 to 4
+        dc100 = array.get(dow_t100,i) + array.get(dow_t200,i)
+        table.cell(t2, i+1, 9, pct(dc100, array.get(dow_sig,i)), text_color=color.lime, text_size=size.small)
+    table.cell(t2,6,9,pct(s1l_c100+s1s_c100+s2l_c100+s2s_c100, totalSig), text_color=color.lime, text_size=size.small)
+
+    table.cell(t2,0,10,"200%", text_color=color.aqua, text_size=size.small)
+    for i = 0 to 4
+        table.cell(t2, i+1, 10, pct(array.get(dow_t200,i), array.get(dow_sig,i)), text_color=color.aqua, text_size=size.small)
+    table.cell(t2,6,10,pct(s1l_t200+s1s_t200+s2l_t200+s2s_t200, totalSig), text_color=color.aqua, text_size=size.small)
+
+    wc2 = color.new(color.green, 50)
+    table.cell(t2,0,11,"WIN RATE", text_color=color.white, text_size=size.small, bgcolor=wc2)
+    for i = 0 to 4
+        dwin = array.get(dow_fw,i) + array.get(dow_t50,i) + array.get(dow_t100,i) + array.get(dow_t200,i)
+        table.cell(t2, i+1, 11, pct(dwin, array.get(dow_sig,i)), text_color=color.white, text_size=size.small, bgcolor=wc2)
+    totalWin = s1l_win + s1s_win + s2l_win + s2s_win
+    table.cell(t2,6,11,pct(totalWin, totalSig), text_color=color.white, text_size=size.small, bgcolor=wc2)
+
+
+// Scale anchor — keeps drawings on the candle price scale
+plot(close, "scale_anchor", color=color.new(color.gray, 100), editable=false)
