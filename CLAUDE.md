@@ -197,6 +197,26 @@ detection) are intentionally NOT changed — they're a different pattern
 (wick-then-confirm, already bounded to a one-bar confirmation window) where
 "currently beyond the level" is the expected precondition, not a bug.
 
+### Why BOL/BOS have a "failure confirmation" stop on top of the ATR/quartile stop
+A breakout is expected to hold beyond the range edge it broke through. If a
+BOL/BOS trade hasn't by 2 bars after entry (`bar_index > curEbar + 1`), a
+close back inside the range (`close < orHigh` for BOL, `close > orLow` for
+BOS) now counts as a stop-out too — `failureConfirm`, OR'd into every
+`hitS` check in the resolution block (all three Scale stages plus the
+Full@100/Full@50 branch). This exists because the ATR/quartile stop can be
+much wider than "did the breakout actually fail" — price can drift back
+under the range high for several bars without ever tagging a stop that's
+sized off ATR or a range quartile, quietly turning a failed breakout into a
+slow bleed instead of a clean exit. Only applied to BOL/BOS (`curSlot == 0
+or curSlot == 1`) — not the other 10 signals, since MID/wick entries are
+already on the "inside" side of their trigger level by construction, so
+"back inside the range" isn't a failure signal for them the way it is for a
+breakout. This also means FAL/FAS now arm off a breakout that failed this
+way, for free — FA arming is keyed off `curExitReason == 0` (any stop-out of
+slot 0/1), not off a specific stop *type*, so no separate wiring was needed.
+Ported to the ThinkOrSwim BOL strategy (`EvoD_BOL_Strategy_TOS.ts`) first,
+then back-ported here for parity across platforms.
+
 ### Why stop uses candle body / wick-bar extreme, not the confirmation bar's body
 `math.min(open, close)` = body bottom (long stop reference), mirrored for
 shorts. For the six wick-rejection signals specifically, the reference is
