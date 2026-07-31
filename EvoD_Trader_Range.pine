@@ -1,0 +1,1254 @@
+//@version=6
+indicator("EvoD Trader Range", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================
+// EvoD Trader Range — market-open-relative range/IB backtester with a
+// unified 12-signal exit-simulation engine: BOL/BOS (breakout), FAL/FAS
+// (failed-auction reversal), MIDL/MIDS (mid-range cross), and the six
+// wick-rejection signals WHL/WHS/WLL/WLS/WML/WMS (wick a boundary, confirm
+// the reversal on the next bar). Only one trade is ever live at a time,
+// across every signal family — see "LIVE TRADE STATE" below.
+// ============================================================
+
+// ------------------------------------------------------------
+// INPUTS
+// ------------------------------------------------------------
+// --- Backtest date range ---
+// Explicit pickers restored (was a rolling "lookback days" for a while, but
+// that only ever tests "the last N days from today" — no way to isolate a
+// specific season/month for comparison). Defaults are wide/future-dated on
+// purpose so they don't need updating often, but they're still static values
+// (timenow can't be used as an input.time() default — it's series-qualified,
+// not a valid constant expression) — narrow them to whatever window you want
+// to study (e.g. just last summer, or one specific month).
+startDate        = input.time(timestamp("2024-01-01 00:00:00"), "Start Date", group="Date Range")
+endDate          = input.time(timestamp("2027-01-01 00:00:00"), "End Date",   group="Date Range")
+
+// --- Range Shape / Market preset system ---
+// Declared before Session below so Preset appears first in Settings — Range
+// Shape is the input that determines whether Session even applies.
+rangeShape       = input.string("ORB", "Range Shape", options=["IB", "ORB", "EvoD ORB", "Futures Start 15min", "Futures Start IB", "Custom"], group="Preset")
+market           = input.string("New York", "Market", options=["New York", "London", "Tokyo"], group="Preset", tooltip="Ignored by the two Futures Start shapes, which are fixed to the CME daily reopen regardless of market.")
+nHours           = input.float(1.0, "N Hours (IB / ORB / EvoD ORB / Futures Start IB)", minval=0.1, step=0.25, group="Preset")
+entryWindowHours = input.float(6.0, "Entry Window Duration (hours, all non-Custom shapes)", minval=0.5, step=0.5, group="Preset")
+
+// --- Session timezone (Custom shape only) ---
+// NOTE: Pine has no way to conditionally hide inputs based on another
+// input's value — every input.*() always shows in Settings regardless of
+// runtime state (same limitation as "no click handlers" elsewhere in this
+// project). The "(Custom shape only)" label is the closest available signal
+// that these six fields are inert unless Range Shape = Custom.
+tz               = input.string("America/Chicago", "TZ (Custom shape only)", options=["America/Chicago","America/New_York","America/Los_Angeles","Europe/London","UTC"], group="Session (Custom shape only)", tooltip="These settings are only applied when Range Shape is Custom.")
+
+// --- Custom manual HHMM fields (Custom shape only) ---
+rangeStartHM     = input.int(845,  "Range build START (HHMM)",  group="Session (Custom shape only)", tooltip="These settings are only applied when Range Shape is Custom.")
+rangeEndHM       = input.int(945,  "Range build END (HHMM)",    group="Session (Custom shape only)", tooltip="These settings are only applied when Range Shape is Custom.")
+entryStartHM     = input.int(945,  "Entry window START (HHMM)", group="Session (Custom shape only)", tooltip="These settings are only applied when Range Shape is Custom.")
+entryEndHM       = input.int(1030, "Entry window END (HHMM)",   group="Session (Custom shape only)", tooltip="These settings are only applied when Range Shape is Custom.")
+exitHM           = input.int(1200, "Timeout EXIT (HHMM)",       group="Session (Custom shape only)", tooltip="These settings are only applied when Range Shape is Custom.")
+
+// --- Stop / risk ---
+atrLen           = input.int(14, "ATR length", minval=1, group="Risk")
+atrMult          = input.float(1.0, "ATR stop buffer multiplier", minval=0.0, step=0.1, group="Risk")
+
+// --- Holiday exclusion ---
+useHolidays      = input.bool(true, "Exclude US holidays (hardcoded list)", group="Filters")
+minRangeATR      = input.float(1.5, "Range Quality Filter (x ATR14 at entry open, 0=off)", minval=0.0, step=0.1, group="Filters",
+     tooltip="Skips all entries on days where range height < this x ATR14, measured at the entry-window open.")
+
+// --- Display ---
+show_range_lines = input.bool(true, "Show Range Lines + Zones", group="Display")
+show_labels      = input.bool(true, "Show Signal Labels",         group="Display")
+show_ext_labels  = input.bool(true, "Show Extension Labels (50/100/200%)", group="Display")
+show_price_labels= input.bool(true, "Show Price Labels on Reference Lines (left side)", group="Display")
+recent_only      = input.bool(true, "Range lines: recent N days only", group="Display")
+recent_days      = input.int(20, "How many recent days", minval=1, maxval=250, group="Display")
+range_col        = input.color(color.new(color.orange, 80), "Range zone color",      group="Display")
+entry_col        = input.color(color.new(color.blue,   88), "Entry zone color",       group="Display")
+tableDisplay     = input.string("Full", "Table Display", options=["Full", "Short", "Hidden"], group="Display",
+     tooltip="Full: all metric + day-of-week columns.\nShort: SIGNAL/Trades/Win%/T1/T2/Final Reach% only.\nHidden: no table at all (no click-toggle exists in Pine — this checkbox is the closest thing).")
+
+// --- Signals: per-signal enable toggles ---
+enableBOL        = input.bool(true, "Enable BOL (Break Out Long)",         group="Signals")
+enableBOS        = input.bool(true, "Enable BOS (Break Out Short)",        group="Signals")
+enableFAL        = input.bool(true, "Enable FAL (Failed Auction Long)",    group="Signals")
+enableFAS        = input.bool(true, "Enable FAS (Failed Auction Short)",   group="Signals")
+enableMIDL       = input.bool(true, "Enable MIDL (Mid Cross Long)",        group="Signals")
+enableMIDS       = input.bool(true, "Enable MIDS (Mid Cross Short)",       group="Signals")
+enableWHL        = input.bool(true, "Enable WHL (Wick High -> Long)",      group="Signals")
+enableWHS        = input.bool(true, "Enable WHS (Wick High -> Short)",     group="Signals")
+enableWLL        = input.bool(true, "Enable WLL (Wick Low -> Long)",       group="Signals")
+enableWLS        = input.bool(true, "Enable WLS (Wick Low -> Short)",      group="Signals")
+enableWML        = input.bool(true, "Enable WML (Wick Mid -> Long)",       group="Signals")
+enableWMS        = input.bool(true, "Enable WMS (Wick Mid -> Short)",      group="Signals")
+
+// --- Alerts (grouped by signal family; fire on confirmed bar close) ---
+alert_bo         = input.bool(true,  "Alert: BOL/BOS breakout entries",     group="Alerts")
+alert_fa         = input.bool(true,  "Alert: FAL/FAS reversal entries",     group="Alerts")
+alert_mid        = input.bool(true,  "Alert: MIDL/MIDS entries",           group="Alerts")
+alert_wick       = input.bool(true,  "Alert: Wick-rejection entries",       group="Alerts")
+
+// --- Exit Simulation ---
+exitMode         = input.string("Scale", "Exit Mode", options=["Scale", "Full@100", "Full@50"], group="Exit Simulation",
+     tooltip="Scale: 1/3 @ 50%, 1/3 @ 100%, 1/3 runs to 200%/stop/timeout, stop to breakeven after first scale-out.\nFull@100: whole position exits at 100% target or stop/timeout.\nFull@50: whole position exits at 50% target or stop/timeout.")
+mnqContracts     = input.int(1, "MNQ contracts (for $ expectancy column)", minval=1, group="Exit Simulation")
+
+// --- Export ---
+exportToLog      = input.bool(false, "Export table to Pine Logs (CSV, on last bar)", group="Export",
+     tooltip="Writes the full table as CSV to the Pine Logs panel (bottom panel, next to Strategy Tester) so you can select/copy it — e.g. to paste into an AI chat. Pine can't touch the system clipboard or write files directly, so this is the closest thing to a real export.")
+
+// Convert HHMM inputs to minutes-since-midnight
+hm2min(hm) => math.floor(hm / 100) * 60 + (hm % 100)
+
+// ------------------------------------------------------------
+// HOLIDAY EXCLUSION — US federal holidays
+// ------------------------------------------------------------
+_hm = month(time, tz)
+_hd = dayofmonth(time, tz)
+_hy = year(time, tz)
+_ha = _hy==2025 and _hm==7  and _hd==4
+_hb = _hy==2025 and _hm==9  and _hd==1
+_hc = _hy==2025 and _hm==11 and _hd==11
+_hdd = _hy==2025 and _hm==11 and _hd==27
+_he = _hy==2025 and _hm==11 and _hd==28
+_hf = _hy==2025 and _hm==12 and _hd==25
+_hg = _hy==2025 and _hm==12 and _hd==26
+_hh = _hy==2026 and _hm==1  and _hd==1
+_hi = _hy==2026 and _hm==1  and _hd==19
+_hj = _hy==2026 and _hm==2  and _hd==16
+_hk = _hy==2026 and _hm==4  and _hd==3
+_hl = _hy==2026 and _hm==5  and _hd==25
+_hm2 = _hy==2026 and _hm==7  and _hd==3
+_hn = _hy==2026 and _hm==9  and _hd==7
+_ho = _hy==2026 and _hm==11 and _hd==11
+_hp = _hy==2026 and _hm==11 and _hd==26
+_hq = _hy==2026 and _hm==12 and _hd==25
+isHol = useHolidays and (_ha or _hb or _hc or _hdd or _he or _hf or _hg or _hh or _hi or _hj or _hk or _hl or _hm2 or _hn or _ho or _hp or _hq)
+
+// ------------------------------------------------------------
+// MARKET / SESSION RESOLUTION
+// Custom uses the manual HHMM fields in the `tz` timezone, unchanged from
+// before. Every other shape is computed relative to a market open (New
+// York/London/Tokyo, DST-correct via IANA timezone strings) or, for the two
+// Futures Start shapes, the CME's own daily maintenance reopen (fixed to
+// America/Chicago regardless of the Market picker, since it's a CME-specific
+// schedule, not tied to NY/London/Tokyo equity opens).
+// NOTE: this assumes the resulting range/entry window stays within a single
+// calendar day in the relevant timezone. With the default N=1h and 6h entry
+// window this always holds; a very large N could cross local midnight and
+// isn't handled — same-day is the supported case.
+// ------------------------------------------------------------
+isCustom   = rangeShape == "Custom"
+isFutures  = rangeShape == "Futures Start 15min" or rangeShape == "Futures Start IB"
+
+marketTz     = market == "New York" ? "America/New_York" : market == "London" ? "Europe/London" : "Asia/Tokyo"
+marketOpenHM = market == "New York" ? 930 : market == "London" ? 800 : 900
+
+effectiveTz = isCustom ? tz : isFutures ? "America/Chicago" : marketTz
+
+barHour        = hour(time, effectiveTz)
+barMinute      = minute(time, effectiveTz)
+barTimeMinutes = barHour * 60 + barMinute
+
+marketOpenM = hm2min(marketOpenHM)
+cmeReopenM  = hm2min(1700)   // CME daily maintenance reopen, 5:00 PM CT
+nMin        = math.round(nHours * 60)
+entryWinMin = math.round(entryWindowHours * 60)
+
+_rangeStartM = isCustom ? hm2min(rangeStartHM) :
+     rangeShape == "IB"                   ? marketOpenM :
+     rangeShape == "ORB"                  ? marketOpenM - nMin :
+     rangeShape == "EvoD ORB"             ? marketOpenM + 15 - nMin :
+     rangeShape == "Futures Start 15min"  ? cmeReopenM :
+     cmeReopenM  // Futures Start IB
+
+_rangeEndM = isCustom ? hm2min(rangeEndHM) :
+     rangeShape == "IB"                   ? marketOpenM + nMin :
+     rangeShape == "ORB"                  ? marketOpenM :
+     rangeShape == "EvoD ORB"             ? marketOpenM + 15 :
+     rangeShape == "Futures Start 15min"  ? cmeReopenM + 15 :
+     cmeReopenM + nMin  // Futures Start IB
+
+_entryStartM = isCustom ? hm2min(entryStartHM) : _rangeEndM
+_entryEndM   = isCustom ? hm2min(entryEndHM)   : _rangeEndM + entryWinMin
+_exitM       = isCustom ? hm2min(exitHM)       : _entryEndM
+
+rangeStartM = _rangeStartM
+rangeEndM   = _rangeEndM
+entryStartM = _entryStartM
+entryEndM   = _entryEndM
+exitM       = _exitM
+
+inRange     = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM
+entryWindow = barTimeMinutes >= entryStartM and barTimeMinutes < entryEndM
+exitMin     = exitM
+inDateRange = time >= startDate and time <= endDate
+validDay    = inDateRange and not isHol
+
+// Uses effectiveTz (the same timezone the session/range math uses), not the
+// fixed `tz` input — otherwise a non-Custom shape (e.g. Market=Tokyo) could
+// bucket a trade into the wrong calendar day whenever the two timezones
+// disagree near a midnight boundary.
+dw = dayofweek(time, effectiveTz)
+// Sunday bars are the start of the trading week (CME/forex reopen Sunday
+// evening) and belong to "Monday's" session for day-of-week bucketing, not
+// a stray Saturday/Sunday default — without this, any Sunday-evening entry
+// (relevant now that Futures Start shapes can begin then) would silently
+// misbucket into the Friday column.
+dowNow = (dw == dayofweek.sunday or dw == dayofweek.monday) ? 0 : dw == dayofweek.tuesday ? 1 : dw == dayofweek.wednesday ? 2 : dw == dayofweek.thursday ? 3 : 4
+
+atr14 = ta.atr(atrLen)
+
+// Pure function (no global mutation) — tighter-of-two stop shared by all 12
+// signals. refPrice is the relevant structural reference: the entry candle's
+// own body level for close-through signals (BOL/BOS/MIDL/MIDS), or the wick
+// bar's own extreme for wick-rejection signals (WHL/WHS/WLL/WLS/WML/WMS).
+tighterStop(isLong, refPrice, entryPrice, atrVal, atrMultV, rangeH) =>
+    bodyStop = isLong ? refPrice - atrVal * atrMultV : refPrice + atrVal * atrMultV
+    qtrStop  = isLong ? entryPrice - rangeH * 0.25 : entryPrice + rangeH * 0.25
+    isLong ? math.max(bodyStop, qtrStop) : math.min(bodyStop, qtrStop)
+
+// ------------------------------------------------------------
+// RANGE CALCULATION
+// ------------------------------------------------------------
+var float orHigh      = na
+var float orLow       = na
+var bool  rangeSet    = false
+var int   rangeStartT = na
+
+isFirstRangeBar = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM and (barTimeMinutes[1] < rangeStartM or barTimeMinutes[1] >= rangeEndM)
+
+if isFirstRangeBar
+    orHigh      := high
+    orLow       := low
+    rangeSet    := false
+    rangeStartT := time
+
+if inRange and not na(orHigh)
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow,  low)
+
+if barTimeMinutes >= rangeEndM and barTimeMinutes < entryEndM and barTimeMinutes[1] < rangeEndM
+    rangeSet := true
+
+rangeHeight = not na(orHigh) and not na(orLow) ? orHigh - orLow : na
+mid         = not na(orHigh) and not na(orLow) ? (orHigh + orLow) / 2 : na
+
+// Range Quality Filter — ATR captured once, at the bar the entry window
+// opens, so the filter is a stable per-day gate.
+var float entryAtrToday = na
+if barTimeMinutes >= entryStartM and barTimeMinutes[1] < entryStartM
+    entryAtrToday := atr14
+rangeQualityOK = minRangeATR <= 0 or (not na(rangeHeight) and not na(entryAtrToday) and rangeHeight >= minRangeATR * entryAtrToday)
+
+// ------------------------------------------------------------
+// RANGE LINES (time-anchored, recent-N-days pruned)
+// ------------------------------------------------------------
+var line[]  rangeLines  = array.new_line()
+var box[]   rangeBoxes  = array.new_box()
+var box     currentDayRangeBox = na
+// Today's price-level labels (q1/mid/q3 + the 6 extension levels) live here
+// instead of being fire-and-forget — every bar, their x-position gets moved
+// to track the current bar (see the floating-label update block further
+// down), so they read near the right edge instead of scrolling off-screen
+// at their original draw-time position. Cleared and rebuilt each new day.
+var label[] floatLabels = array.new_label()
+
+if rangeSet and show_range_lines and validDay and barTimeMinutes >= rangeEndM and barTimeMinutes[1] < rangeEndM
+    // Retire yesterday's floating labels — only the current day's levels track the last bar.
+    while array.size(floatLabels) > 0
+        label.delete(array.shift(floatLabels))
+
+    rStartT   = rangeStartT
+    rangeEndT = time
+    entryEndT = time + math.max(entryEndM - rangeEndM, 30) * 60 * 1000
+
+    lh = line.new(time, orHigh, entryEndT, orHigh, xloc=xloc.bar_time, color=color.new(color.orange, 20), width=2, style=line.style_solid)
+    ll = line.new(time, orLow,  entryEndT, orLow,  xloc=xloc.bar_time, color=color.new(color.orange, 20), width=2, style=line.style_solid)
+    array.push(rangeLines, lh)
+    array.push(rangeLines, ll)
+
+    bRange = box.new(rStartT, orHigh, rangeEndT, orLow,
+         xloc=xloc.bar_time,
+         border_color=color.new(color.orange, 40),
+         border_width=1,
+         bgcolor=range_col)
+    array.push(rangeBoxes, bRange)
+    currentDayRangeBox := bRange
+
+    bEntry = box.new(rangeEndT, orHigh, entryEndT, orLow,
+         xloc=xloc.bar_time,
+         border_color=color.new(color.blue, 50),
+         border_width=1,
+         bgcolor=entry_col)
+    array.push(rangeBoxes, bEntry)
+
+    // Range size in points — lower-right corner of the range box. No bubble
+    // (fully transparent fill = text only), anchored exactly at the box's
+    // corner (no inset) — style_label_lower_right already grows the text
+    // up-and-left from that point, so this is as tight as Pine's coordinate
+    // system allows without clipping into the border.
+    label.new(rangeEndT, orLow, xloc=xloc.bar_time,
+         text="Range size: " + str.tostring(rangeHeight, "#.##") + " pts",
+         style=label.style_label_lower_right,
+         color=color.new(color.orange, 100),
+         textcolor=color.white, size=size.normal)
+
+    // ── Internal range splits (25%, 50%, 75%) ──────────────
+    rng  = orHigh - orLow
+    q1   = orLow + rng * 0.25
+    q3   = orLow + rng * 0.75
+
+    splitLevels = array.from(q1, mid, q3)
+    for si = 0 to 2
+        sLvl = array.get(splitLevels, si)
+        splitLine = line.new(rStartT, sLvl, entryEndT, sLvl,
+             xloc=xloc.bar_time,
+             color=color.new(color.orange, 55),
+             width=1,
+             style=line.style_dashed)
+        array.push(rangeLines, splitLine)
+        // Price label — starts at the line's left edge, then floats to track
+        // the current bar every bar (see the update block below this section).
+        // style_label_left so the text extends RIGHT of its anchor, past the
+        // last candle, instead of back over the bars.
+        if show_price_labels
+            qLbl = label.new(rStartT, sLvl, xloc=xloc.bar_time,
+                 text=str.tostring(sLvl, "#.##"), style=label.style_label_left,
+                 color=color.new(color.orange, 55), textcolor=color.white, size=size.small)
+            array.push(floatLabels, qLbl)
+
+    // ── Extensions above/below range (50%, 100%, 200%) ───────
+    extMults  = array.new_float(3)
+    array.set(extMults, 0, 0.5)
+    array.set(extMults, 1, 1.0)
+    array.set(extMults, 2, 2.0)
+    extLabels = array.new_string(3)
+    array.set(extLabels, 0, "50%")
+    array.set(extLabels, 1, "100%")
+    array.set(extLabels, 2, "200%")
+
+    for i = 0 to 2
+        mult  = array.get(extMults, i)
+        elbl  = array.get(extLabels, i)
+        ecol  = i < 2 ? color.new(color.lime, 40 - i * 15) : color.new(color.aqua, 20)
+        lvlUp = orHigh + rng * mult
+        lvlDn = orLow  - rng * mult
+
+        extUp = line.new(rangeEndT, lvlUp, entryEndT, lvlUp,
+             xloc=xloc.bar_time,
+             color=ecol, width=1, style=line.style_dashed)
+        array.push(rangeLines, extUp)
+
+        extDn = line.new(rangeEndT, lvlDn, entryEndT, lvlDn,
+             xloc=xloc.bar_time,
+             color=ecol, width=1, style=line.style_dashed)
+        array.push(rangeLines, extDn)
+
+        if show_ext_labels
+            label.new(entryEndT, lvlUp, xloc=xloc.bar_time,
+                 text=elbl, style=label.style_label_left,
+                 color=color.new(ecol, 20),
+                 textcolor=color.white, size=size.tiny)
+            label.new(entryEndT, lvlDn, xloc=xloc.bar_time,
+                 text=elbl, style=label.style_label_left,
+                 color=color.new(ecol, 20),
+                 textcolor=color.white, size=size.tiny)
+
+        // Price labels — float to track the current bar, same as the quartile ones above.
+        if show_price_labels
+            eLblUp = label.new(rangeEndT, lvlUp, xloc=xloc.bar_time,
+                 text=str.tostring(lvlUp, "#.##"), style=label.style_label_left,
+                 color=color.new(ecol, 20), textcolor=color.white, size=size.small)
+            array.push(floatLabels, eLblUp)
+            eLblDn = label.new(rangeEndT, lvlDn, xloc=xloc.bar_time,
+                 text=str.tostring(lvlDn, "#.##"), style=label.style_label_left,
+                 color=color.new(ecol, 20), textcolor=color.white, size=size.small)
+            array.push(floatLabels, eLblDn)
+
+    // Active config label on the range box (shows true active times)
+    if barstate.isconfirmed
+        label.new(rangeEndT, orHigh, xloc=xloc.bar_time,
+             text=rangeShape + (isFutures ? "" : " (" + market + ")") + " | " + str.tostring(math.floor(rangeStartM/60)) + ":" + str.tostring(rangeStartM%60,"00") + "-" + str.tostring(math.floor(rangeEndM/60)) + ":" + str.tostring(rangeEndM%60,"00"),
+             style=label.style_label_lower_left,
+             color=color.new(color.gray, 70),
+             textcolor=color.new(color.white, 20),
+             size=size.normal)
+
+    // Prune old objects
+    maxObjs = recent_only ? recent_days : 100000
+    while array.size(rangeLines) > maxObjs * 20
+        line.delete(array.shift(rangeLines))
+    while array.size(rangeBoxes) > maxObjs * 2
+        box.delete(array.shift(rangeBoxes))
+
+// Float today's price-level labels to the current bar. Gated on
+// barstate.islast — only the final position ever matters visually, so
+// repositioning on every historical bar during calculation would just be
+// wasted work; this keeps it to the current bar (and realtime tick updates
+// of it) instead of firing once per bar across the whole lookback.
+if show_price_labels and array.size(floatLabels) > 0 and barstate.islast
+    floatX = time + 10 * 60 * 1000
+    for fi = 0 to array.size(floatLabels) - 1
+        label.set_x(array.get(floatLabels, fi), floatX)
+
+// ------------------------------------------------------------
+// STATS ACCUMULATORS
+// Setup axis (cs_*) indexed by slot 0-11 (see slot map below).
+// Cross-tab (cx_*) indexed by slot*5+dow (0-59) for the per-signal,
+// per-weekday win/loss columns.
+// Overall (ov_*) is its own running sequence (not derivable by summing)
+// because max-drawdown and loss-streak depend on chronological trade order.
+//
+// SLOT MAP: 0=BOL 1=BOS 2=FAL 3=FAS 4=MIDL 5=MIDS 6=WHL 7=WHS 8=WLL 9=WLS 10=WML 11=WMS
+// ------------------------------------------------------------
+var cs_tot        = array.new_int(12, 0)
+var cs_wins       = array.new_int(12, 0)
+var cs_losses     = array.new_int(12, 0)
+var cs_sumWin     = array.new_float(12, 0.0)
+var cs_sumLoss    = array.new_float(12, 0.0)
+var cs_sumPts     = array.new_float(12, 0.0)
+var cs_equity     = array.new_float(12, 0.0)
+var cs_peak       = array.new_float(12, 0.0)
+var cs_maxDD      = array.new_float(12, 0.0)
+var cs_curLossStr = array.new_int(12, 0)
+var cs_maxLossStr = array.new_int(12, 0)
+var cs_sumRng     = array.new_float(12, 0.0)
+var cs_sumAtr     = array.new_float(12, 0.0)
+var cs_reachT1    = array.new_int(12, 0)
+var cs_reachT2    = array.new_int(12, 0)
+var cs_reachT3    = array.new_int(12, 0)
+
+var cx_wins       = array.new_int(60, 0)
+var cx_losses     = array.new_int(60, 0)
+
+var int   ov_tot        = 0
+var int   ov_wins       = 0
+var int   ov_losses     = 0
+var float ov_sumWin     = 0.0
+var float ov_sumLoss    = 0.0
+var float ov_sumPts     = 0.0
+var float ov_equity     = 0.0
+var float ov_peak       = 0.0
+var float ov_maxDD      = 0.0
+var int   ov_curLossStr = 0
+var int   ov_maxLossStr = 0
+var float ov_sumRng     = 0.0
+var float ov_sumAtr     = 0.0
+
+// ------------------------------------------------------------
+// LIVE TRADE STATE — only one trade is ever open, across every signal
+// family. A single set of scalars (not a 12-slot array) since mutual
+// exclusion means there's never more than one in flight.
+// ------------------------------------------------------------
+var bool  tradeLive   = false
+var int   curSlot     = 0
+var bool  curLong     = false
+var float curEntry    = na
+var float curStopCur  = na
+var float curT1       = na
+var float curT2       = na
+var float curT3       = na
+var int   curStage    = 0
+var float curRealized = 0.0
+var bool  curH1       = false
+var bool  curH2       = false
+var bool  curH3       = false
+var int   curDow      = 0
+var int   curEbar     = na
+var float curRangeH   = na
+var float curAtrE     = na
+
+// Failed-Auction arming state (BOL/BOS stopped out -> watch the opposite edge)
+var bool  fa_armed    = false
+var bool  fa_longFail = false
+var bool  fa_done     = false   // caps FA at one reversal per day, unchanged from before
+
+// Pending wick-then-confirm candidates — one tracker per boundary x direction.
+// Set on the wick bar, consumed (checked + cleared) on the very next bar only.
+var bool  pendWHL = false
+var float pendWHL_hi = na
+var float pendWHL_lo = na
+var bool  pendWHS = false
+var float pendWHS_hi = na
+var float pendWHS_lo = na
+var bool  pendWLL = false
+var float pendWLL_hi = na
+var float pendWLL_lo = na
+var bool  pendWLS = false
+var float pendWLS_hi = na
+var float pendWLS_lo = na
+var bool  pendWML = false
+var float pendWML_hi = na
+var float pendWML_lo = na
+var bool  pendWMS = false
+var float pendWMS_hi = na
+var float pendWMS_lo = na
+
+// Daily reset
+if isFirstRangeBar
+    tradeLive := false
+if barTimeMinutes >= rangeEndM and barTimeMinutes[1] < rangeEndM
+    fa_armed    := false
+    fa_longFail := false
+    fa_done     := false
+    pendWHL := false
+    pendWHS := false
+    pendWLL := false
+    pendWLS := false
+    pendWML := false
+    pendWMS := false
+
+// ------------------------------------------------------------
+// RESOLUTION — the one live trade's reach-tracking + exit mechanics.
+// Reach-tracking (curH1/curH2/curH3) is informational and independent of
+// exitMode — it answers "did price ever touch this leg," separate from
+// whatever the actual exit-simulation P&L outcome was.
+// Same-bar target+stop tie resolves as a STOP (conservative assumption).
+// Scale mode moves the remainder's stop to breakeven after the first leg.
+// ------------------------------------------------------------
+curPts = 0.0
+curResolved = false
+curExitReason = -1   // 0=stop 1=target/final 2=timeout
+
+if tradeLive and validDay and bar_index > curEbar
+    if curLong
+        if high >= curT1 and not curH1
+            curH1 := true
+        if high >= curT2 and not curH2
+            curH2 := true
+        if high >= curT3 and not curH3
+            curH3 := true
+    else
+        if low <= curT1 and not curH1
+            curH1 := true
+        if low <= curT2 and not curH2
+            curH2 := true
+        if low <= curT3 and not curH3
+            curH3 := true
+
+    dirSign = curLong ? 1 : -1
+    if exitMode == "Scale"
+        if curStage == 0
+            hitT = curLong ? high >= curT1 : low <= curT1
+            hitS = curLong ? close < curStopCur : close > curStopCur
+            if hitT and hitS
+                curPts := (curStopCur - curEntry) * dirSign
+                curResolved := true
+                curExitReason := 0
+            else if hitT
+                curRealized := curRealized + (curT1 - curEntry) * dirSign * (1.0/3)
+                curStopCur  := curEntry
+                curStage    := 1
+            else if hitS
+                curPts := (curStopCur - curEntry) * dirSign
+                curResolved := true
+                curExitReason := 0
+        else if curStage == 1
+            hitT = curLong ? high >= curT2 : low <= curT2
+            hitS = curLong ? close < curStopCur : close > curStopCur
+            if hitT and hitS
+                curPts := curRealized + (curStopCur - curEntry) * dirSign * (2.0/3)
+                curResolved := true
+                curExitReason := 0
+            else if hitT
+                curRealized := curRealized + (curT2 - curEntry) * dirSign * (1.0/3)
+                curStage    := 2
+            else if hitS
+                curPts := curRealized + (curStopCur - curEntry) * dirSign * (2.0/3)
+                curResolved := true
+                curExitReason := 0
+        else
+            hitT = curLong ? high >= curT3 : low <= curT3
+            hitS = curLong ? close < curStopCur : close > curStopCur
+            if hitT and hitS
+                curPts := curRealized + (curStopCur - curEntry) * dirSign * (1.0/3)
+                curResolved := true
+                curExitReason := 0
+            else if hitT
+                curPts := curRealized + (curT3 - curEntry) * dirSign * (1.0/3)
+                curResolved := true
+                curExitReason := 1
+            else if hitS
+                curPts := curRealized + (curStopCur - curEntry) * dirSign * (1.0/3)
+                curResolved := true
+                curExitReason := 0
+    else
+        tgt = exitMode == "Full@50" ? curT1 : curT2
+        hitT = curLong ? high >= tgt : low <= tgt
+        hitS = curLong ? close < curStopCur : close > curStopCur
+        if hitT and hitS
+            curPts := (curStopCur - curEntry) * dirSign
+            curResolved := true
+            curExitReason := 0
+        else if hitT
+            curPts := (tgt - curEntry) * dirSign
+            curResolved := true
+            curExitReason := 1
+        else if hitS
+            curPts := (curStopCur - curEntry) * dirSign
+            curResolved := true
+            curExitReason := 0
+
+// Timeout (only if not already resolved above this bar)
+if barTimeMinutes >= exitMin and barTimeMinutes[1] < exitMin and tradeLive and validDay and not curResolved
+    dirSignT = curLong ? 1 : -1
+    remFrac  = curStage == 0 ? 1.0 : curStage == 1 ? 2.0/3 : 1.0/3
+    curPts        := curRealized + (close - curEntry) * dirSignT * remFrac
+    curResolved   := true
+    curExitReason := 2
+
+// Record outcome + free the gate
+if curResolved
+    tradeLive := false
+    curIsWin  = curPts > 0
+    slotIdx   = curSlot
+    dowIdx    = curDow
+    cxIdx     = slotIdx * 5 + dowIdx
+
+    ov_tot += 1
+    if curIsWin
+        ov_wins += 1
+        ov_sumWin += curPts
+    else
+        ov_losses += 1
+        ov_sumLoss += -curPts
+    ov_sumPts += curPts
+    ov_equity += curPts
+    ov_peak  := math.max(ov_peak, ov_equity)
+    ov_maxDD := math.max(ov_maxDD, ov_peak - ov_equity)
+    if curIsWin
+        ov_curLossStr := 0
+    else
+        ov_curLossStr += 1
+        ov_maxLossStr := math.max(ov_maxLossStr, ov_curLossStr)
+    ov_sumRng += curRangeH
+    ov_sumAtr += curAtrE
+
+    array.set(cs_tot, slotIdx, array.get(cs_tot, slotIdx) + 1)
+    if curIsWin
+        array.set(cs_wins, slotIdx, array.get(cs_wins, slotIdx) + 1)
+        array.set(cs_sumWin, slotIdx, array.get(cs_sumWin, slotIdx) + curPts)
+        array.set(cx_wins, cxIdx, array.get(cx_wins, cxIdx) + 1)
+    else
+        array.set(cs_losses, slotIdx, array.get(cs_losses, slotIdx) + 1)
+        array.set(cs_sumLoss, slotIdx, array.get(cs_sumLoss, slotIdx) + (-curPts))
+        array.set(cx_losses, cxIdx, array.get(cx_losses, cxIdx) + 1)
+    array.set(cs_sumPts, slotIdx, array.get(cs_sumPts, slotIdx) + curPts)
+    newEq   = array.get(cs_equity, slotIdx) + curPts
+    array.set(cs_equity, slotIdx, newEq)
+    newPeak = math.max(array.get(cs_peak, slotIdx), newEq)
+    array.set(cs_peak, slotIdx, newPeak)
+    array.set(cs_maxDD, slotIdx, math.max(array.get(cs_maxDD, slotIdx), newPeak - newEq))
+    if curIsWin
+        array.set(cs_curLossStr, slotIdx, 0)
+    else
+        newStr = array.get(cs_curLossStr, slotIdx) + 1
+        array.set(cs_curLossStr, slotIdx, newStr)
+        array.set(cs_maxLossStr, slotIdx, math.max(array.get(cs_maxLossStr, slotIdx), newStr))
+    array.set(cs_sumRng, slotIdx, array.get(cs_sumRng, slotIdx) + curRangeH)
+    array.set(cs_sumAtr, slotIdx, array.get(cs_sumAtr, slotIdx) + curAtrE)
+    if curH1
+        array.set(cs_reachT1, slotIdx, array.get(cs_reachT1, slotIdx) + 1)
+    if curH2
+        array.set(cs_reachT2, slotIdx, array.get(cs_reachT2, slotIdx) + 1)
+    if curH3
+        array.set(cs_reachT3, slotIdx, array.get(cs_reachT3, slotIdx) + 1)
+
+    // Arm Failed-Auction watch: only a BOL(0)/BOS(1) stop-out arms it
+    if curExitReason == 0 and (slotIdx == 0 or slotIdx == 1) and not fa_done
+        fa_armed    := true
+        fa_longFail := slotIdx == 0
+
+    // Entry/exit visual label with outcome + realized points
+    if show_labels
+        oTxt = curExitReason == 0 ? "STOP" : curExitReason == 1 ? "TARGET" : "TIMEOUT"
+        oCol = curExitReason == 0 ? color.red : curExitReason == 1 ? color.lime : color.gray
+        label.new(time, curLong ? high : low, xloc=xloc.bar_time, text=oTxt + " " + str.tostring(curPts, "#.##"), style=curLong ? label.style_label_down : label.style_label_up, color=color.new(oCol, 30), textcolor=color.white, size=size.tiny)
+
+// ------------------------------------------------------------
+// SHARED ENTRY GATE
+// ------------------------------------------------------------
+canEnter = rangeSet and entryWindow and validDay and not na(rangeHeight) and not tradeLive and rangeQualityOK
+
+// Slot name lookup, used in entry labels
+slotName(s) =>
+    s == 0 ? "BOL" : s == 1 ? "BOS" : s == 2 ? "FAL" : s == 3 ? "FAS" :
+     s == 4 ? "MIDL" : s == 5 ? "MIDS" : s == 6 ? "WHL" : s == 7 ? "WHS" :
+     s == 8 ? "WLL" : s == 9 ? "WLS" : s == 10 ? "WML" : "WMS"
+
+// ------------------------------------------------------------
+// BOL / BOS — breakout through the range edge
+// ------------------------------------------------------------
+if canEnter
+    rng = rangeHeight
+    if enableBOL and open <= orHigh and close > orHigh
+        tradeLive  := true
+        curSlot    := 0
+        curLong    := true
+        curEntry   := close
+        bodyRef    = math.min(open, close)
+        curStopCur := tighterStop(true, bodyRef, close, atr14, atrMult, rng)
+        curT1      := close + rng * 0.5
+        curT2      := close + rng * 1.0
+        curT3      := close + rng * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rng
+        curAtrE    := atr14
+        stopDist   = close - curStopCur
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="BOL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.green,20), textcolor=color.white, size=size.small)
+        if alert_bo
+            alert("BOL breakout entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    else if enableBOS and open >= orLow and close < orLow
+        tradeLive  := true
+        curSlot    := 1
+        curLong    := false
+        curEntry   := close
+        bodyRef    = math.max(open, close)
+        curStopCur := tighterStop(false, bodyRef, close, atr14, atrMult, rng)
+        curT1      := close - rng * 0.5
+        curT2      := close - rng * 1.0
+        curT3      := close - rng * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rng
+        curAtrE    := atr14
+        stopDist   = curStopCur - close
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="BOS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.red,20), textcolor=color.white, size=size.small)
+        if alert_bo
+            alert("BOS breakout entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ------------------------------------------------------------
+// FAL / FAS — after a BOL/BOS stop-out, watch the opposite edge
+// ------------------------------------------------------------
+if canEnter and fa_armed and not fa_done
+    rng = rangeHeight
+    if fa_longFail and enableFAS and open >= orLow and close < orLow
+        fa_done    := true
+        tradeLive  := true
+        curSlot    := 3
+        curLong    := false
+        curEntry   := close
+        bodyRef    = math.max(open, close)
+        curStopCur := tighterStop(false, bodyRef, close, atr14, atrMult, rng)
+        curT1      := close - rng * 0.5
+        curT2      := close - rng * 1.0
+        curT3      := close - rng * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rng
+        curAtrE    := atr14
+        stopDist   = curStopCur - close
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="FAS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.fuchsia,20), textcolor=color.white, size=size.small)
+        if alert_fa
+            alert("FAS reversal entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    else if (not fa_longFail) and enableFAL and open <= orHigh and close > orHigh
+        fa_done    := true
+        tradeLive  := true
+        curSlot    := 2
+        curLong    := true
+        curEntry   := close
+        bodyRef    = math.min(open, close)
+        curStopCur := tighterStop(true, bodyRef, close, atr14, atrMult, rng)
+        curT1      := close + rng * 0.5
+        curT2      := close + rng * 1.0
+        curT3      := close + rng * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rng
+        curAtrE    := atr14
+        stopDist   = close - curStopCur
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="FAL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.fuchsia,20), textcolor=color.white, size=size.small)
+        if alert_fa
+            alert("FAL reversal entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ------------------------------------------------------------
+// MIDL / MIDS — cross of the mid-range line, edge-triggered
+// ------------------------------------------------------------
+if canEnter and not na(mid)
+    rng = rangeHeight
+    crossedUp   = close[1] <= mid and close > mid
+    crossedDown = close[1] >= mid and close < mid
+    if enableMIDL and crossedUp
+        tradeLive  := true
+        curSlot    := 4
+        curLong    := true
+        curEntry   := close
+        bodyRef    = math.min(open, close)
+        curStopCur := tighterStop(true, bodyRef, close, atr14, atrMult, rng)
+        curT1      := close + rng * 0.5
+        curT2      := close + rng * 1.0
+        curT3      := close + rng * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rng
+        curAtrE    := atr14
+        stopDist   = close - curStopCur
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="MIDL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.teal,20), textcolor=color.white, size=size.small)
+        if alert_mid
+            alert("MIDL cross entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+    else if enableMIDS and crossedDown
+        tradeLive  := true
+        curSlot    := 5
+        curLong    := false
+        curEntry   := close
+        bodyRef    = math.max(open, close)
+        curStopCur := tighterStop(false, bodyRef, close, atr14, atrMult, rng)
+        curT1      := close - rng * 0.5
+        curT2      := close - rng * 1.0
+        curT3      := close - rng * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rng
+        curAtrE    := atr14
+        stopDist   = curStopCur - close
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="MIDS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.teal,20), textcolor=color.white, size=size.small)
+        if alert_mid
+            alert("MIDS cross entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ------------------------------------------------------------
+// WICK-REJECTION CONFIRMATIONS (checked first — using flags set on the
+// PRIOR bar — so a fresh same-bar BOL/FA/MID trigger above always takes
+// precedence per canEnter's `not tradeLive` gate, matching the plan's
+// same-bar precedence rule.)
+// ------------------------------------------------------------
+rngNow = rangeHeight
+
+if canEnter and pendWHL and enableWHL
+    if close > pendWHL_hi
+        tradeLive  := true
+        curSlot    := 6
+        curLong    := true
+        curEntry   := close
+        curStopCur := tighterStop(true, pendWHL_lo, close, atr14, atrMult, rngNow)
+        curT1      := close + rngNow * 0.5
+        curT2      := close + rngNow * 1.0
+        curT3      := close + rngNow * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rngNow
+        curAtrE    := atr14
+        stopDist   = close - curStopCur
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="WHL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.lime,20), textcolor=color.white, size=size.small)
+        if alert_wick
+            alert("WHL confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if canEnter and pendWHS and enableWHS
+    if close < pendWHS_lo
+        tradeLive  := true
+        curSlot    := 7
+        curLong    := false
+        curEntry   := close
+        curStopCur := tighterStop(false, pendWHS_hi, close, atr14, atrMult, rngNow)
+        curT1      := close - rngNow * 0.5
+        curT2      := close - rngNow * 1.0
+        curT3      := close - rngNow * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rngNow
+        curAtrE    := atr14
+        stopDist   = curStopCur - close
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="WHS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.red,20), textcolor=color.white, size=size.small)
+        if alert_wick
+            alert("WHS confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if canEnter and pendWLL and enableWLL
+    if close > pendWLL_hi
+        tradeLive  := true
+        curSlot    := 8
+        curLong    := true
+        curEntry   := close
+        curStopCur := tighterStop(true, pendWLL_lo, close, atr14, atrMult, rngNow)
+        curT1      := close + rngNow * 0.5
+        curT2      := close + rngNow * 1.0
+        curT3      := close + rngNow * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rngNow
+        curAtrE    := atr14
+        stopDist   = close - curStopCur
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="WLL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.green,20), textcolor=color.white, size=size.small)
+        if alert_wick
+            alert("WLL confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if canEnter and pendWLS and enableWLS
+    if close < pendWLS_lo
+        tradeLive  := true
+        curSlot    := 9
+        curLong    := false
+        curEntry   := close
+        curStopCur := tighterStop(false, pendWLS_hi, close, atr14, atrMult, rngNow)
+        curT1      := close - rngNow * 0.5
+        curT2      := close - rngNow * 1.0
+        curT3      := close - rngNow * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rngNow
+        curAtrE    := atr14
+        stopDist   = curStopCur - close
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="WLS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.maroon,20), textcolor=color.white, size=size.small)
+        if alert_wick
+            alert("WLS confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if canEnter and pendWML and enableWML
+    if close > pendWML_hi
+        tradeLive  := true
+        curSlot    := 10
+        curLong    := true
+        curEntry   := close
+        curStopCur := tighterStop(true, pendWML_lo, close, atr14, atrMult, rngNow)
+        curT1      := close + rngNow * 0.5
+        curT2      := close + rngNow * 1.0
+        curT3      := close + rngNow * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rngNow
+        curAtrE    := atr14
+        stopDist   = close - curStopCur
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, low, xloc=xloc.bar_time, text="WML\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.teal,20), textcolor=color.white, size=size.small)
+        if alert_wick
+            alert("WML confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if canEnter and pendWMS and enableWMS
+    if close < pendWMS_lo
+        tradeLive  := true
+        curSlot    := 11
+        curLong    := false
+        curEntry   := close
+        curStopCur := tighterStop(false, pendWMS_hi, close, atr14, atrMult, rngNow)
+        curT1      := close - rngNow * 0.5
+        curT2      := close - rngNow * 1.0
+        curT3      := close - rngNow * 2.0
+        curStage   := 0
+        curRealized:= 0.0
+        curH1      := false
+        curH2      := false
+        curH3      := false
+        curDow     := dowNow
+        curEbar    := bar_index
+        curRangeH  := rngNow
+        curAtrE    := atr14
+        stopDist   = curStopCur - close
+        ticks      = stopDist / syminfo.mintick
+        if show_labels
+            label.new(time, high, xloc=xloc.bar_time, text="WMS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.orange,20), textcolor=color.white, size=size.small)
+        if alert_wick
+            alert("WMS confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// Pending candidates are one-shot: clear regardless of outcome once checked
+pendWHL := false
+pendWHS := false
+pendWLL := false
+pendWLS := false
+pendWML := false
+pendWMS := false
+
+// ------------------------------------------------------------
+// NEW WICK-CANDIDATE DETECTION (sets flags for the NEXT bar's confirmation
+// check above). Boundary-agnostic rule: wick through B with close staying
+// on the ORIGINAL side is a candidate; direction depends on which side.
+// ------------------------------------------------------------
+if rangeSet and entryWindow and validDay and not na(rangeHeight)
+    // orHigh boundary
+    if high >= orHigh and close < orHigh
+        pendWHS    := true
+        pendWHS_hi := high
+        pendWHS_lo := low
+    if low <= orHigh and close > orHigh
+        pendWHL    := true
+        pendWHL_hi := high
+        pendWHL_lo := low
+    // orLow boundary
+    if high >= orLow and close < orLow
+        pendWLS    := true
+        pendWLS_hi := high
+        pendWLS_lo := low
+    if low <= orLow and close > orLow
+        pendWLL    := true
+        pendWLL_hi := high
+        pendWLL_lo := low
+    // mid boundary
+    if not na(mid)
+        if high >= mid and close < mid
+            pendWMS    := true
+            pendWMS_hi := high
+            pendWMS_lo := low
+        if low <= mid and close > mid
+            pendWML    := true
+            pendWML_hi := high
+            pendWML_lo := low
+
+// ------------------------------------------------------------
+// TABLE — one consolidated table. Rows = enabled signals + ALL. Columns =
+// performance metrics + a per-signal, per-weekday win/loss cross-tab.
+// Row count is computed from how many toggles are on, so a disabled signal
+// drops its row entirely instead of showing zeros.
+// ------------------------------------------------------------
+pct(n, d) => d > 0 ? str.tostring(math.round(n / d * 100)) + "%" : "—"
+avgOrNA(sum, n) => n > 0 ? str.tostring(sum / n, "#.##") : "—"
+pfOrNA(winSum, lossSum) => lossSum > 0 ? str.tostring(winSum / lossSum, "#.##") : (winSum > 0 ? "∞" : "—")
+usdOrNA(sum, n, perPt, contracts) => n > 0 ? "$" + str.tostring(sum / n * perPt * contracts, "#.##") : "—"
+
+enabledCount = (enableBOL?1:0) + (enableBOS?1:0) + (enableFAL?1:0) + (enableFAS?1:0) + (enableMIDL?1:0) + (enableMIDS?1:0) + (enableWHL?1:0) + (enableWHS?1:0) + (enableWLL?1:0) + (enableWLS?1:0) + (enableWML?1:0) + (enableWMS?1:0)
+// Short mode = SIGNAL/Trades/Win%/T1/T2/Final Reach% only (6 cols). Hidden
+// still needs a valid table object (Pine tables can't have 0 rows/cols), so
+// it's sized to a harmless 1x1 and left fully transparent instead — there's
+// no click-to-toggle in Pine, this checkbox is the closest equivalent.
+tableCols = tableDisplay == "Full" ? 20 : tableDisplay == "Short" ? 6 : 1
+tableRows = tableDisplay == "Hidden" ? 1 : 1 + enabledCount + 1   // header + signals + ALL
+tblBg     = tableDisplay == "Hidden" ? color.new(color.black,100) : color.new(color.black,10)
+tblBorder = tableDisplay == "Hidden" ? color.new(color.gray,100)  : color.gray
+
+var table t = table.new(position.bottom_left, tableCols, tableRows, bgcolor=tblBg, border_color=tblBorder, border_width=1, frame_color=tblBorder, frame_width=1)
+// Config summary — its own small stacked table at middle_left, the screen
+// slot directly above bottom_left. Hides together with the main table (same
+// transparent-when-Hidden treatment). 5th row is a warning that only shows
+// text when today falls outside Start/End Date — the exact silent
+// "zero signals" trap from earlier, now surfaced instead of discovered the
+// hard way.
+var table cfgTable = table.new(position.middle_left, 2, 5, bgcolor=tblBg, border_color=tblBorder, border_width=1, frame_color=tblBorder, frame_width=1)
+// Latches so the CSV export fires exactly once per script run (once per settings
+// change / chart reload) instead of spamming Pine Logs on every realtime tick.
+// Must be `varip`, not `var`: plain `var` does NOT persist across realtime tick
+// updates on the still-forming last bar — each new tick re-evaluates that bar
+// from its state as of the last *confirmed* bar, silently resetting a `var`
+// latch back to false and refiring on every tick. `varip` is the keyword built
+// specifically to survive intra-bar realtime ticks. (Pine scripts also can't
+// uncheck their own input to stop themselves — this is the only way to get
+// "fires once" behavior out of a plain checkbox toggle.)
+varip bool exportedOnce = false
+
+if barstate.islast and tableDisplay != "Hidden"
+    isEnabled = array.new_bool(12, true)
+    array.set(isEnabled, 0, enableBOL)
+    array.set(isEnabled, 1, enableBOS)
+    array.set(isEnabled, 2, enableFAL)
+    array.set(isEnabled, 3, enableFAS)
+    array.set(isEnabled, 4, enableMIDL)
+    array.set(isEnabled, 5, enableMIDS)
+    array.set(isEnabled, 6, enableWHL)
+    array.set(isEnabled, 7, enableWHS)
+    array.set(isEnabled, 8, enableWLL)
+    array.set(isEnabled, 9, enableWLS)
+    array.set(isEnabled, 10, enableWML)
+    array.set(isEnabled, 11, enableWMS)
+
+    slotNames = array.from("BOL","BOS","FAL","FAS","MIDL","MIDS","WHL","WHS","WLL","WLS","WML","WMS")
+
+    hc = color.new(color.maroon, 20)
+    table.cell(t,0,0,"SIGNAL",       text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t,1,0,"Trades",      text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t,2,0,"Win%",        text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t,3,0,"T1 Rch%",     text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t,4,0,"T2 Rch%",     text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    table.cell(t,5,0,"Fin Rch%",    text_color=color.yellow, text_size=size.small, bgcolor=hc)
+    if tableDisplay == "Full"
+        table.cell(t,6,0,"AvgWin",      text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,7,0,"AvgLoss",     text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,8,0,"Exp(pts)",    text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,9,0,"Exp($MNQ)",   text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,10,0,"PF",         text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,11,0,"MaxDD",      text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,12,0,"MaxLossStr", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,13,0,"AvgRng",     text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,14,0,"AvgATR",     text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,15,0,"MON", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,16,0,"TUE", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,17,0,"WED", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,18,0,"THU", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+        table.cell(t,19,0,"FRI", text_color=color.yellow, text_size=size.small, bgcolor=hc)
+
+    row = 1
+    for s = 0 to 11
+        if array.get(isEnabled, s)
+            tot   = array.get(cs_tot, s)
+            wins  = array.get(cs_wins, s)
+            rc = s == 0 or s == 2 or s == 4 or s == 6 or s == 8 or s == 10 ? color.lime : color.orange
+            table.cell(t,0,row, array.get(slotNames, s), text_color=rc, text_size=size.small)
+            table.cell(t,1,row, str.tostring(tot), text_color=color.white, text_size=size.small)
+            table.cell(t,2,row, pct(wins, tot), text_color=color.lime, text_size=size.small)
+            table.cell(t,3,row, pct(array.get(cs_reachT1,s), tot), text_color=color.lime, text_size=size.small)
+            table.cell(t,4,row, pct(array.get(cs_reachT2,s), tot), text_color=color.lime, text_size=size.small)
+            table.cell(t,5,row, pct(array.get(cs_reachT3,s), tot), text_color=color.aqua, text_size=size.small)
+            if tableDisplay == "Full"
+                table.cell(t,6,row, avgOrNA(array.get(cs_sumWin,s), wins), text_color=color.lime, text_size=size.small)
+                table.cell(t,7,row, avgOrNA(array.get(cs_sumLoss,s), array.get(cs_losses,s)), text_color=color.red, text_size=size.small)
+                table.cell(t,8,row, avgOrNA(array.get(cs_sumPts,s), tot), text_color=color.white, text_size=size.small)
+                table.cell(t,9,row, usdOrNA(array.get(cs_sumPts,s), tot, 2.0, mnqContracts), text_color=color.white, text_size=size.small)
+                table.cell(t,10,row, pfOrNA(array.get(cs_sumWin,s), array.get(cs_sumLoss,s)), text_color=color.aqua, text_size=size.small)
+                table.cell(t,11,row, str.tostring(array.get(cs_maxDD,s), "#.##"), text_color=color.orange, text_size=size.small)
+                table.cell(t,12,row, str.tostring(array.get(cs_maxLossStr,s)), text_color=color.orange, text_size=size.small)
+                table.cell(t,13,row, avgOrNA(array.get(cs_sumRng,s), tot), text_color=color.gray, text_size=size.small)
+                table.cell(t,14,row, avgOrNA(array.get(cs_sumAtr,s), tot), text_color=color.gray, text_size=size.small)
+                for d = 0 to 4
+                    cxi   = s * 5 + d
+                    dWins = array.get(cx_wins, cxi)
+                    dTot  = dWins + array.get(cx_losses, cxi)
+                    dPct  = dTot > 0 ? dWins / dTot * 100 : -1.0
+                    dCol  = dPct < 0 ? color.gray : dPct > 50 ? color.lime : color.red
+                    dTxt  = dTot > 0 ? pct(dWins, dTot) + " (" + str.tostring(dTot) + ")" : "—"
+                    table.cell(t, 15 + d, row, dTxt, text_color=dCol, text_size=size.small)
+            row += 1
+
+    // ALL row — sums across every slot (not just enabled ones, so disabling
+    // a signal doesn't quietly change historical totals already recorded)
+    allRow = row
+    wc = color.new(color.green, 50)
+    table.cell(t,0,allRow,"ALL", text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t,1,allRow, str.tostring(ov_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t,2,allRow, pct(ov_wins, ov_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t,3,allRow, "—", text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t,4,allRow, "—", text_color=color.white, text_size=size.small, bgcolor=wc)
+    table.cell(t,5,allRow, "—", text_color=color.white, text_size=size.small, bgcolor=wc)
+    if tableDisplay == "Full"
+        table.cell(t,6,allRow, avgOrNA(ov_sumWin, ov_wins), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,7,allRow, avgOrNA(ov_sumLoss, ov_losses), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,8,allRow, avgOrNA(ov_sumPts, ov_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,9,allRow, usdOrNA(ov_sumPts, ov_tot, 2.0, mnqContracts), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,10,allRow, pfOrNA(ov_sumWin, ov_sumLoss), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,11,allRow, str.tostring(ov_maxDD, "#.##"), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,12,allRow, str.tostring(ov_maxLossStr), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,13,allRow, avgOrNA(ov_sumRng, ov_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+        table.cell(t,14,allRow, avgOrNA(ov_sumAtr, ov_tot), text_color=color.white, text_size=size.small, bgcolor=wc)
+        for d = 0 to 4
+            dW = 0
+            dL = 0
+            for s = 0 to 11
+                dW += array.get(cx_wins, s*5+d)
+                dL += array.get(cx_losses, s*5+d)
+            dTotAll = dW + dL
+            dTxtAll = dTotAll > 0 ? pct(dW, dTotAll) + " (" + str.tostring(dTotAll) + ")" : "—"
+            table.cell(t, 15 + d, allRow, dTxtAll, text_color=color.white, text_size=size.small, bgcolor=wc)
+
+    // Config summary — separate stacked table at middle_left (see cfgTable
+    // declaration above), 4 key/value rows.
+    table.cell(cfgTable,0,0,"Shape", text_color=color.yellow, text_size=size.small)
+    table.cell(cfgTable,1,0,rangeShape + " (" + market + ")", text_color=color.yellow, text_size=size.small)
+    table.cell(cfgTable,0,1,"Measure/Entry", text_color=color.yellow, text_size=size.small)
+    table.cell(cfgTable,1,1,str.tostring(nHours,"#.##") + "h / " + str.tostring(entryWindowHours,"#.##") + "h", text_color=color.yellow, text_size=size.small)
+    table.cell(cfgTable,0,2,"Exit/Filter", text_color=color.yellow, text_size=size.small)
+    table.cell(cfgTable,1,2,exitMode + " / " + (minRangeATR<=0 ? "off" : str.tostring(minRangeATR,"#.#")+"xATR"), text_color=color.yellow, text_size=size.small)
+    table.cell(cfgTable,0,3,"MNQ", text_color=color.yellow, text_size=size.small)
+    table.cell(cfgTable,1,3,"x" + str.tostring(mnqContracts), text_color=color.yellow, text_size=size.small)
+
+    // Warning row — checks against timenow (actual real-world today), not the
+    // last loaded bar's time, since "is today covered" is what actually
+    // matters: a range that ends last month will silently stop tracking new
+    // signals the moment today passes endDate, even while old bars still
+    // render fine. Blank (not just hidden — Pine can't remove a table row)
+    // when the range is fine, so it doesn't nag on every normal chart.
+    dateOutOfRange = timenow < startDate or timenow > endDate
+    warnBg = dateOutOfRange ? color.new(color.red, 10) : tblBg
+    table.cell(cfgTable,0,4,dateOutOfRange ? "⚠ OUT OF RANGE" : "", text_color=color.white, text_size=size.small, bgcolor=warnBg)
+    table.cell(cfgTable,1,4,dateOutOfRange ? "today not in Start/End Date" : "", text_color=color.white, text_size=size.small, bgcolor=warnBg)
+
+    // ---- Export: same data as the table above, dumped as CSV to Pine Logs
+    // (bottom panel, next to Strategy Tester). Log entries are selectable
+    // text, unlike table cells or labels, so this is the practical way to
+    // get this data out of Pine — e.g. to paste into an AI chat. Fires once
+    // per script run (see exportedOnce above) — leaving the checkbox on
+    // during a live chart won't keep re-logging on every tick.
+    if exportToLog and not exportedOnce
+        exportedOnce := true
+        csvBody = "SIGNAL,Trades,Win%,T1_Reach%,T2_Reach%,Final_Reach%,AvgWin,AvgLoss,Exp_pts,Exp_USD_MNQ,PF,MaxDD,MaxLossStreak,AvgRange,AvgATR,MonWin,MonLoss,TueWin,TueLoss,WedWin,WedLoss,ThuWin,ThuLoss,FriWin,FriLoss"
+        for s = 0 to 11
+            if array.get(isEnabled, s)
+                tot2  = array.get(cs_tot, s)
+                wins2 = array.get(cs_wins, s)
+                csvLine = array.get(slotNames, s) + "," + str.tostring(tot2) + "," + pct(wins2, tot2) + "," + pct(array.get(cs_reachT1,s), tot2) + "," + pct(array.get(cs_reachT2,s), tot2) + "," + pct(array.get(cs_reachT3,s), tot2) + "," + avgOrNA(array.get(cs_sumWin,s), wins2) + "," + avgOrNA(array.get(cs_sumLoss,s), array.get(cs_losses,s)) + "," + avgOrNA(array.get(cs_sumPts,s), tot2) + "," + usdOrNA(array.get(cs_sumPts,s), tot2, 2.0, mnqContracts) + "," + pfOrNA(array.get(cs_sumWin,s), array.get(cs_sumLoss,s)) + "," + str.tostring(array.get(cs_maxDD,s), "#.##") + "," + str.tostring(array.get(cs_maxLossStr,s)) + "," + avgOrNA(array.get(cs_sumRng,s), tot2) + "," + avgOrNA(array.get(cs_sumAtr,s), tot2)
+                for d = 0 to 4
+                    cxi2 = s * 5 + d
+                    csvLine := csvLine + "," + str.tostring(array.get(cx_wins, cxi2)) + "," + str.tostring(array.get(cx_losses, cxi2))
+                csvBody := csvBody + "\n" + csvLine
+        allLine = "ALL," + str.tostring(ov_tot) + "," + pct(ov_wins, ov_tot) + ",,,," + avgOrNA(ov_sumWin, ov_wins) + "," + avgOrNA(ov_sumLoss, ov_losses) + "," + avgOrNA(ov_sumPts, ov_tot) + "," + usdOrNA(ov_sumPts, ov_tot, 2.0, mnqContracts) + "," + pfOrNA(ov_sumWin, ov_sumLoss) + "," + str.tostring(ov_maxDD, "#.##") + "," + str.tostring(ov_maxLossStr) + "," + avgOrNA(ov_sumRng, ov_tot) + "," + avgOrNA(ov_sumAtr, ov_tot)
+        for d = 0 to 4
+            dW2 = 0
+            dL2 = 0
+            for s = 0 to 11
+                dW2 += array.get(cx_wins, s*5+d)
+                dL2 += array.get(cx_losses, s*5+d)
+            allLine := allLine + "," + str.tostring(dW2) + "," + str.tostring(dL2)
+        csvBody := csvBody + "\n" + allLine
+        csvBody := csvBody + "\nCONFIG," + rangeShape + " (" + market + "),N=" + str.tostring(nHours,"#.##") + "h,Entry=" + str.tostring(entryWindowHours,"#.##") + "h,Exit:" + exitMode + ",Filter:" + (minRangeATR<=0 ? "off" : str.tostring(minRangeATR,"#.#")+"xATR") + ",MNQ x" + str.tostring(mnqContracts)
+        log.info(csvBody)
+
+// Scale anchor — keeps drawings on the candle price scale
+plot(close, "scale_anchor", color=color.new(color.gray, 100), editable=false)
