@@ -7,13 +7,16 @@ breaking things or repeating mistakes already solved.
 
 ## What This Project Is
 
-Two Pine Script v6 indicators for TradingView that backtest range-breakout trading
-strategies across any instrument (futures, stocks, forex). Built for a prop trading
-account (Apex 25K) with a specific set of qualified instruments and rules.
+A Pine Script v6 indicator for TradingView that backtests range-breakout,
+mid-range-cross, and wick-rejection trading strategies across any instrument
+(futures, stocks, forex), anchored to New York/London/Tokyo market opens or
+the CME's daily reopen. Built for a prop trading account (Apex 25K).
 
-**Primary file:** `EvoD_Trader_ORB_Backtest.pine` — this is the one to edit.
-**Secondary file:** `EvoD_NewsReversal_Backtest.pine` — standalone, separate logic.
+**Primary file:** `EvoD_Trader_Range.pine` — this is the one to edit. Renamed
+from `EvoD_Trader_ORB_Backtest.pine` since the tool now covers far more than
+opening-range breakouts.
 **Ignore:** Any other `.pine` files in the repo are old/superseded versions.
+**Removed:** `EvoD_NewsReversal_Backtest.pine` was deleted — abandoned approach, do not recreate.
 
 ---
 
@@ -46,15 +49,21 @@ var int c=0
 ```
 
 ### 3. No modifying global variables inside functions
-Pine v6 forbids functions from writing to global `var` counters:
+Pine v6 forbids functions from writing to global `var` state — including
+`array.set()`/`array.push()` on a global array — from inside a `=>` function
+body:
 ```pine
 myFunc() =>
-    globalCounter += 1  // ❌ CE10088 error
+    globalCounter += 1        // ❌ CE10088 error
+    array.set(globalArr, 0, 1) // ❌ also forbidden
 ```
-**The workaround we use:** Set `rr_*` flag variables (e.g. `rr_go`, `rr_out`,
-`rr_dow`) inside the trade logic, then process them in a top-level `if rr_go`
-block that increments the actual counters. See the "PROCESS RESULT" section
-in the ORB script.
+**The workaround we use:** every stat-accumulator update (`cs_*`, `cx_*`,
+`ov_*`) happens directly at the top level, inside plain `if` blocks in the
+main script body — never wrapped in a function. Nesting depth doesn't matter
+(3+ levels of `if`/`else` is fine); only crossing into a `=>` function body
+is forbidden. The only functions in this script are pure calculations with
+no side effects (`hm2min`, `tighterStop`, `pct`, `avgOrNA`, `pfOrNA`,
+`usdOrNA`, `slotName`) — none of them touch a global variable.
 
 ### 4. No `array.from()` with color types
 ```pine
@@ -103,67 +112,179 @@ Pine v6 paragraph borders only support `top` and `bottom`. Adding `left` or
 `right` to a paragraph border causes a validation error. Table cell borders
 support all four sides.
 
-### 9. Timezone functions must use the `tz` variable
-Always pass the user-configured timezone:
+### 9. Timezone functions must use the effective timezone variable
+Always pass the relevant timezone, never the bare chart timezone:
 ```pine
-barHour = hour(time, tz)    // ✅
-barHour = hour(time)        // ❌ uses chart timezone, not user setting
+barHour = hour(time, effectiveTz)    // ✅
+barHour = hour(time)                 // ❌ uses chart timezone, not the shape's timezone
 ```
+`effectiveTz` is `tz` for Custom, the CME's `"America/Chicago"` for the two
+Futures Start shapes, or the selected market's IANA timezone string
+(`"America/New_York"`/`"Europe/London"`/`"Asia/Tokyo"`) otherwise — see
+"Why Range Shape and Market are two separate pickers" below.
+
+### 10. `timenow` can't be used as an `input.time()` default
+`timenow` is series-qualified (it changes as real time passes), and
+`input.*` default values must not be. This is why the date range is a plain
+`lookbackDays` integer input instead of two `input.time()` pickers — both
+`startDate`/`endDate` are computed as `timenow ± lookbackDays*86400000` at
+the top level, never inside an input default expression.
+
+**Update:** the lookback-days approach was reverted back to explicit
+`startDate`/`endDate` via `input.time()` — a rolling "last N days from now"
+window can't isolate a specific season or month (e.g. "just last summer"),
+which is a real use case. The gotcha above still applies if this ever comes
+up again: `input.time()` defaults must be static `timestamp(...)` literals,
+never `timenow`-derived, which is why the defaults are wide/future-dated
+(2024-01-01 → 2027-01-01) rather than computed — they're meant to be
+narrowed manually per backtest, not auto-updated.
 
 ---
 
 ## Architecture Decisions
 
-### Why the `rr_*` flag pattern exists
-Pine v6 forbids functions from modifying global variables (CE10088). All counter
-increments happen in a top-level `if rr_go` block ("PROCESS RESULT"). The trade
-resolution logic sets `rr_go := true` plus outcome details (`rr_out`, `rr_isLong`,
-`rr_isS2`, `rr_dow`), then the process block reads them and increments counters.
+### Why only one trade can be live at a time, across every signal family
+With 12 signal types (BOL, BOS, FAL, FAS, MIDL, MIDS, WHL, WHS, WLL, WLS,
+WML, WMS), giving each its own independent position-tracking state (the old
+`a1_*`/`a2_*`/`x1_*`/`x2_*` pattern, duplicated 12 times) would be enormous
+and unmaintainable. Instead: a **single set of "current trade" scalars**
+(`tradeLive`, `curSlot`, `curEntry`, `curStopCur`, `curT1/T2/T3`, `curStage`,
+`curRealized`, `curH1/H2/H3`, `curDow`, `curEbar`, `curRangeH`, `curAtrE`) is
+reused sequentially — valid because a live position blocks every other
+signal from triggering (`canEnter` requires `not tradeLive`), so there is
+never more than one to track. The 12-way split only matters afterward, for
+bucketing a *resolved* trade's stats into `cs_*[slot]`.
 
-### Why stop uses candle body, not wick
-`math.min(open, close)` = body bottom (long stop)
-`math.max(open, close)` = body top (short stop)
-The user explicitly chose body-based stops — wicks would make stops too loose and
-inconsistent. The ATR buffer is added on top of the body level.
+**Re-entry**: a live trade only frees the gate on stop-out or reaching the
+final target — not on partial scale-outs. Any signal (not just the one that
+was live) can trigger next, immediately, same day, as many times as the
+entry window allows.
 
-### Why stop is triggered by bar CLOSE not intrabar wick
-A 5-min bar closing beyond the stop level confirms the move. Wicks create too many
-false stops on volatile instruments like MGC and M2K. This is intentional.
+**Same-bar chaining is expected, not a bug**: the resolution block runs
+*before* the entry-trigger blocks each bar, so if a trade's stop-out bar's
+close also satisfies another signal's trigger, that signal fires the same
+bar. For MID trades specifically this is the *common* case: since entry ≈
+mid, stopping out away from entry means the close is, by construction,
+already back on the opposite side of mid.
 
-### Why targets use intrabar HIGH/LOW touch
-Targets (50/100/200%) register when the bar's high or low touches the level, not
-requiring a close. This is the opposite of stop behavior and is intentional — it
-gives credit for the move without requiring a close beyond the target.
+**Same-bar precedence**: a fresh, immediate trigger (BOL/BOS/FAL/FAS/MIDL/
+MIDS closing through a level) is checked *before* wick-rejection
+confirmations each bar, so an immediate signal always wins a same-bar race
+against the laggier (two-bar) wick layer. Wick confirmations only look at
+the *immediately preceding* bar's pending candidate — they're one-shot, not
+held open waiting for a slot to free up.
 
-### Why outcome buckets are exclusive and cumulative
-The targets are **cumulative** (50% = reached at least 50%, includes 100/200 trades)
-and **exclusive** (each trade lands in exactly one bucket). This was a deliberate
-fix — the original script double-counted by recording 50%, 100%, and 200% as
-separate non-exclusive counters, causing columns to sum over 100%.
+### Why FAL/FAS specifically still cap at one per day
+Unlike the other ten signals (gated purely by `not tradeLive`), FAL/FAS also
+check `fa_done`, which only resets at the next day's range-end crossing.
+This preserves the original Failed-Auction behavior exactly: it's a
+second, dependent entry watching the opposite edge after a BOL/BOS stop-out,
+not a general-purpose reversal signal, and only ever fires once per arming
+cycle.
 
-**Furthest target reached wins:** if a trade touches 50% then later stops, it
-books as 50% (a win), not a stop. This prevents double-counting.
+### Why BOL/BOS/FAL/FAS require the entry bar's OPEN inside the range, not just the close outside
+`close > orHigh` alone is a *state* check (true on every subsequent bar while
+price stays beyond the edge), not a *crossing* check. Once BOL/BOS lost their
+daily cap (see above), that distinction became a real bug: a trending move
+would keep re-triggering fresh entries bar after bar as each prior one
+resolved, scattered far from the actual range edge, not clustered at it.
+Fixed by requiring `open <= orHigh and close > orHigh` (mirrored for the
+other three) — the entry bar must itself span the boundary, matching gotcha
+#5's boundary-crossing principle applied to price instead of time. FAL/FAS
+got the same fix for consistency even though `fa_done` already bounded the
+practical impact. The wick-candidate conditions (`WHL`/`WLS` boundary
+detection) are intentionally NOT changed — they're a different pattern
+(wick-then-confirm, already bounded to a one-bar confirmation window) where
+"currently beyond the level" is the expected precondition, not a bug.
 
-WIN RATE = 50% + 100% + 200% + Timeout W
-LOSS RATE = Stop + Timeout L
-WIN + LOSS = 100% always.
+### Why stop uses candle body / wick-bar extreme, not the confirmation bar's body
+`math.min(open, close)` = body bottom (long stop reference), mirrored for
+shorts. For the six wick-rejection signals specifically, the reference is
+the **wick bar's own high/low** (not the confirmation bar's body) — the
+wick bar is what defines the rejection level; the confirmation bar just
+proves it. Both feed the same `tighterStop()` function.
 
-### Why `bar_index > entryBar` exists in resolution
-The entry bar itself is excluded from stop/target resolution. Without this, a large
-entry candle could immediately trigger the stop on the same bar it entered.
+### Why every signal uses the tighter of body/wick-extreme ± ATR vs. a quartile cap
+`tighterStop(isLong, refPrice, entryPrice, atrVal, atrMultV, rangeH)` picks
+`math.max(bodyStop, quartileStop)` for longs / `math.min(...)` for shorts —
+whichever is closer to entry:
+- `bodyStop` = refPrice ± ATR14×mult
+- `quartileStop` = entry ∓ rangeHeight×0.25
 
-### Why the preset overrides manual session fields
-The preset dropdown uses `_rangeStartHM` etc. (underscore-prefixed) computed from
-the preset, falling back to the user's manual inputs only when preset = "Custom".
-The manual fields in the Session group are cosmetically visible but functionally
-ignored unless Custom is selected. This is by design — Pine can't auto-populate
-input fields programmatically.
+This guarantees the stop never exceeds one quartile of the range, so R/R to
+the 50% target is never worse than 1:1 even when ATR is unusually wide
+relative to the day's range. When the quartile cap is the one actually
+chosen, the day's range box border turns amber instead of orange. All 12
+signals use this same function — there's no longer a separate
+`stopMode`/`computeStopSim` system with ATR/RangePct/Hybrid options; that
+was retired in favor of one unified model.
+
+### Why targets are still entry ± rangeHeight × {0.5, 1.0, 2.0} for every signal
+Kept uniform rather than giving MID/wick signals their own structural
+targets. For MID-anchored entries this naturally lands the first leg almost
+exactly at the range edge already (entry≈mid, so `mid + 0.5×rng ≈ orHigh`) —
+no special-casing needed.
+
+### Why targets register on intrabar HIGH/LOW touch but reach-tracking is separate from the P&L exit
+Targets touching (not requiring a close) is intentional — it credits the
+move without requiring a close beyond the target. `curH1`/`curH2`/`curH3`
+track whether each leg was ever touched, **independent of exitMode** — this
+feeds the table's "Reach%" columns (a trade can touch T1 informationally
+and still stop out on the remainder in Scale mode; both facts are recorded).
+The actual realized P&L (`curPts`) is a separate calculation driven by
+`exitMode` (Scale/Full@100/Full@50).
+
+### Why `bar_index > curEbar` exists in resolution
+The entry bar itself is excluded from stop/target resolution. Without this, a
+large entry candle could immediately trigger the stop on the same bar it entered.
+
+### Why Range Shape and Market are two separate pickers
+Rather than enumerating combo presets ("NY ORB", "London IB", ...), Range
+Shape (`IB`/`ORB`/`EvoD ORB`/`Futures Start 15min`/`Futures Start IB`/
+`Custom`) and Market (`New York`/`London`/`Tokyo`) are independent inputs.
+Shape defines the time offsets; Market defines which open those offsets are
+relative to. The two Futures Start shapes ignore Market entirely — they're
+fixed to the CME's own daily maintenance reopen (5:00 PM CT), which is a
+CME-specific schedule, not an NY/London/Tokyo equity concept. `effectiveTz`
+picks the right timezone for each case (see gotcha #9) so DST is handled
+correctly via IANA timezone strings rather than fixed offsets.
+
+**Known limitation**: the session math assumes the resulting range/entry
+window stays within a single calendar day in the relevant timezone. This
+always holds with the default `nHours=1.0`/`entryWindowHours=6.0`; a very
+large `nHours` could push the range start across local midnight, which
+isn't handled (same-day is the supported case).
+
+### Why Sunday bars bucket as Monday for day-of-week stats
+CME futures (and forex) reopen Sunday evening, and that session is
+"Monday's" trading day, not a stray weekend bucket. `dowNow` maps
+`dayofweek.sunday` to index 0 (same as Monday) — without this, any
+Sunday-evening entry (relevant now that Futures Start shapes can begin then)
+would silently misbucket into the Friday column, since the old mapping
+defaulted anything that wasn't Mon–Thu to index 4.
+
+### Why the old t1/t2 MFE-style tables were retired
+They tracked "furthest target reached" without any real exit logic, which
+overstates results (a trade touching 50% then reversing to the stop logged
+as a win). Every signal now goes through the same real exit simulation
+(entry → stop/target/scale-out → recorded outcome) into one consolidated
+table, with reach-rate ("Reach%") columns preserving the old table's
+touch-rate information alongside the real P&L numbers.
+
+### Why the performance table's row count is computed from the enable toggles
+`table.new()` needs its row count at creation time. `tableRows = 1 (header)
++ enabledCount + 1 (ALL) + 1 (footer)`, where `enabledCount` sums the 12
+per-signal boolean inputs. Disabling a signal drops its row entirely instead
+of showing a zeroed-out one. The ALL row always sums every slot regardless
+of current toggle state, so toggling a signal off doesn't change historical
+totals already recorded for it.
 
 ### Why visual elements use `xloc.bar_time` not `xloc.bar_index`
-`bar_index` anchored objects shift when TradingView loads more historical data
-(bar indices get reassigned). `xloc.bar_time` anchors to Unix timestamps which
-never shift. All `line.new()`, `box.new()`, and `label.new()` calls must use
-`xloc=xloc.bar_time` and pass `time` (not `bar_index`) as the x coordinate.
+`bar_index` anchored objects shift when TradingView loads more historical
+data (bar indices get reassigned). `xloc.bar_time` anchors to Unix
+timestamps which never shift. All `line.new()`, `box.new()`, and
+`label.new()` calls must use `xloc=xloc.bar_time` and pass `time` (not
+`bar_index`) as the x coordinate.
 
 ### Why there's a `plot(close, "scale_anchor", ...)` at the bottom
 Without any `plot()` call, TradingView gives the indicator its own price axis
@@ -175,19 +296,17 @@ share the candle price scale so labels and lines track candles vertically on scr
 ## Known Issues / To-Do List
 
 ### Pending features (not yet built)
-1. **Range size filter** — skip S1 signals when range height < N × ATR(14).
-   On small ranges (e.g. 11.6 pts with ATR ~5) the stop is nearly as large as the
-   50% target, making R/R unfavorable. Add `minRangeRatio` input (default 2.0),
-   color range box red when too small, suppress signals.
-
-2. **Market open presets** — offset-based session times anchored to market opens
-   (NY Futures 7:30 CT, NY Equities 8:30 CT, London 2:00 CT, Tokyo 6:00 PM CT).
-   Instead of HHMM inputs, user would set minutes-before-open and range duration.
-   Opens stored in UTC internally; Pine converts to chart timezone automatically.
-
-3. **Conditional probability tracking** — "given S1 reached 50%, what % then
-   reached 100%?" Currently the script tracks cumulative probabilities. Adding
-   conditional tracking would sharpen the scaling math (2/5 + 2/5 + 1/5 exits).
+1. **Backtest re-validation** — the "Qualified Instruments" table below
+   reflects the *pre-rewrite* MFE-touch model (old S1/S2). The exit-sim
+   engine, unified stop model, and new signal set (BOL/BOS/FAL/FAS/MIDL/
+   MIDS + 6 wick signals) haven't been re-backtested against those numbers
+   yet. Treat the win-rate table as historical context, not current truth,
+   until re-run.
+2. **Table width on smaller screens** — the consolidated table is 25 columns
+   wide by design (one table, not three) per explicit user preference; worth
+   revisiting if it's unreadable on a given screen size.
+3. **Large `nHours` crossing local midnight** — see the "Known limitation"
+   note under Range Shape/Market above.
 
 ### Previously attempted, reverted
 - **Multi-timeframe (MTF) support** — attempted to force 5-min calculation on
@@ -198,32 +317,45 @@ share the candle price scale so labels and lines track candles vertically on scr
 
 ---
 
-## Instrument Configuration Reference
+## Range Shape / Market Reference
 
-| Instrument | Range Start | Range End | Entry Start | Entry End | Exit | TZ |
-|---|---|---|---|---|---|---|
-| MES / MGC / M2K / M6E | 745 | 845 | 845 | 930 | 1200 | America/Chicago |
-| AAPL / stocks | 400 | 930 | 945 | 1130 | 1400 | America/New_York |
-| IB First Hour | 930 | 1030 | 1030 | 1600 | 1600 | America/Chicago |
+| Range Shape | Window | Uses Market picker? |
+|---|---|---|
+| IB | `[open, open+N hours]` | Yes |
+| ORB | `[open−N hours, open]` | Yes |
+| EvoD ORB | `[open+15min−N hours, open+15min]` | Yes |
+| Futures Start 15min | `[CME reopen, +15min]` (fixed, CT) | No |
+| Futures Start IB | `[CME reopen, +N hours]` (CT) | No |
+| Custom | Manual HHMM, in the `tz` input | No |
 
-**Extended hours:** ON for futures and IB. OFF or ON for stocks (ON required if
-range start is before 9:30 ET).
+Entry window for every non-Custom shape: `[rangeEnd, rangeEnd +
+entryWindowHours]`, exit = end of that window (no separate timeout time).
+Market opens: New York 9:30 AM ET, London 8:00 AM GMT/BST, Tokyo 9:00 AM JST.
+
+**Extended hours:** ON for futures and IB-style shapes. OFF or ON for stocks
+(ON required if the range start falls before 9:30 ET).
 
 ---
 
 ## Qualified Instruments (66%+ win rate threshold, Jun 2025–Jun 2026 backtest)
 
+**⚠ Pre-rewrite data — see "Backtest re-validation" above.** These numbers
+were measured against the old S1/S2 MFE-touch model, not the current
+exit-simulation engine or the new signal set. Useful for historical
+intuition about which instruments/days had edge; not a substitute for
+re-running the new backtest.
+
 | Instrument | Setup | Direction | Win Rate | Best Days | Notes |
 |---|---|---|---|---|---|
-| MGC (Gold micro) | S1 | SHORT | 71% / 75% Thu | Tue/Thu/Fri | Skip Mon/Wed |
-| M2K (Russell micro) | S1 | LONG | 71% / 67% Thu | Thursday | Borderline other days |
+| MGC (Gold micro) | S1 (→BOL/BOS) | SHORT | 71% / 75% Thu | Tue/Thu/Fri | Skip Mon/Wed |
+| M2K (Russell micro) | S1 (→BOL/BOS) | LONG | 71% / 67% Thu | Thursday | Borderline other days |
 | M6E (Euro micro) | All | All | 69% Tue / 67% Thu | Tue/Thu only | Fri 35% — avoid |
-| MES (ES micro) | S1 | LONG | 61% | Any | Borderline; supplemental |
+| MES (ES micro) | S1 (→BOL/BOS) | LONG | 61% | Any | Borderline; supplemental |
 | MNQ (NQ micro) | — | — | 44% | — | NO EDGE — do not use |
 | MYM (Dow micro) | — | — | 50% | — | NO EDGE — do not use |
 | MCL (Crude micro) | — | — | No day ≥66% | — | Removed from plan |
 
-**Day-of-week pattern:**
+**Day-of-week pattern (pre-rewrite):**
 - Monday: dead (50–75% loss rate)
 - Tuesday: qualified (MGC 67%, M6E 69%)
 - Wednesday: dead (50–69% loss rate)
@@ -244,26 +376,36 @@ range start is before 9:30 ET).
 
 ---
 
-## Script Structure (EvoD_Trader_ORB_Backtest.pine)
+## Script Structure (EvoD_Trader_Range.pine)
 
 Sections in order:
 1. `indicator()` declaration
-2. INPUTS (Preset, Date Range, Session, Risk, Display, Alerts)
-3. HOLIDAY EXCLUSION (US federal holidays hardcoded)
-4. SESSION HELPERS (hm2min, barTimeMinutes, window booleans, dowNow, atr14)
-5. RANGE CALCULATION (orHigh, orLow, rangeSet, isFirstRangeBar)
-6. RANGE LINES + ZONE BOXES (orange range, blue entry, dashed splits, extensions)
-7. OUTCOME COUNTERS (e1l/e1s/e2l/e2s × tot/stop/t50/t100/t200/fw/fl, DOW arrays)
-8. TRADE STATE (a1_* for S1/FA, a2_* for S2, rr_* recording flags)
-9. DAILY RESET
-10. S1 RESOLUTION (target touches, stop check, noon exit)
-11. S2 RESOLUTION (same structure)
-12. PROCESS RESULT (reads rr_*, increments counters — the global-mod workaround)
-13. SETUP 1 — Initial Breakout entry
-14. FAILED AUCTION REVERSAL entry
-15. SETUP 2 — Wick Retest entry
-16. TABLES (top-right overall, bottom-right day-of-week)
-17. Scale anchor plot
+2. INPUTS (Date Range, Session/Custom, Range Shape/Market preset, Risk,
+   Filters, Display, Signals enable toggles, Alerts, Exit Simulation)
+3. `hm2min` helper
+4. HOLIDAY EXCLUSION (US federal holidays hardcoded)
+5. MARKET / SESSION RESOLUTION (effectiveTz, barTimeMinutes, rangeStartM/
+   rangeEndM/entryStartM/entryEndM/exitM computed from Range Shape × Market,
+   dowNow with the Sunday→Monday mapping, `tighterStop()`)
+6. RANGE CALCULATION (orHigh, orLow, mid, rangeSet, isFirstRangeBar, range
+   quality filter)
+7. RANGE LINES + ZONE BOXES (orange range, blue entry, dashed splits +
+   left-side price labels, extensions, range-size label)
+8. STATS ACCUMULATORS (`cs_*` size-12 setup axis, `cx_*` size-60
+   signal×weekday cross-tab, `ov_*` overall running sequence)
+9. LIVE TRADE STATE (single `cur*` scalar set — see "Why only one trade can
+   be live" above), FA arming state, pending-wick-candidate state
+10. DAILY RESET
+11. RESOLUTION (reach-tracking + Scale/Full exit mechanics + timeout +
+    record outcome into `cs_*`/`cx_*`/`ov_*` + arm FA)
+12. Shared entry gate (`canEnter`), `slotName()` helper
+13. BOL / BOS entries
+14. FAL / FAS entries
+15. MIDL / MIDS entries
+16. Wick-rejection confirmations (6 blocks, using prior-bar pending state)
+17. New wick-candidate detection (sets pending state for next bar)
+18. TABLE (one consolidated table, rows = enabled signals + ALL)
+19. Scale anchor plot
 
 ---
 
@@ -271,10 +413,29 @@ Sections in order:
 
 Before committing changes, verify on TradingView:
 - [ ] Compiles without errors on Pine v6
-- [ ] Signals fire on MES 5-min chart (should see ~35 S1 LONG in Jun 2025–Jun 2026)
-- [ ] Columns sum to 100% (WIN RATE + LOSS RATE = 100%)
-- [ ] Orange range boxes draw at correct times (7:45–8:45 CT for OR preset)
+- [ ] BOL/BOS fire roughly where S1 LONG/SHORT used to on MES 5-min (trigger
+      logic is unchanged, only the engine/naming changed)
+- [ ] Table columns are internally consistent: Reach% is non-increasing
+      (T1 ≥ T2 ≥ Final), day-of-week W+L per row roughly equals that row's
+      Trades count
+- [ ] Range box border turns amber (not orange) on days where the quartile
+      stop cap is tighter than body/wick+ATR; entry labels show a matching
+      `ST:` distance ≤ 25% of that day's range height, plus a tick count
+- [ ] Range size (points) label appears in the lower-right corner of each
+      range box; price labels appear at the left of the q1/mid/q3 and
+      50/100/200% lines
 - [ ] Labels/lines track with candles when scrolling (time-anchored)
-- [ ] No signals on Monday or Wednesday for MGC when filtered by day table
-- [ ] Works on AAPL 5-min chart with extended hours ON and stock settings
-- [ ] Preset dropdown switches correctly (footer shows active preset times)
+- [ ] Range Shape × Market combinations draw range boxes at the times you'd
+      expect for each market's real open (spot-check NY, London, Tokyo), and
+      the two Futures Start shapes anchor to 5:00 PM CT regardless of Market
+- [ ] Works on AAPL 5-min chart with extended hours ON and New York market
+- [ ] Works on a forex pair (e.g. EURUSD) — session times still resolve
+      sanely even though "market open" is a looser concept there
+- [ ] Only one trade is ever live at a time — spot-check a busy day's
+      timestamps for overlaps
+- [ ] FAL/FAS and MIDL/MIDS follow-ups can fire on the identical bar as the
+      stop-out that armed them (expected, not a bug)
+- [ ] Wick-rejection signals: manually verify a few on the chart against the
+      2-bar wick-then-confirm pattern before trusting the backtest numbers
+- [ ] Toggling a signal off in Signals removes its row from the table
+      entirely (not just zeros it out)
