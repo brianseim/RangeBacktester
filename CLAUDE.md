@@ -382,17 +382,165 @@ re-running the new backtest.
 - Thursday: best day (MGC 75%, M2K 67%, M6E 67%)
 - Friday: qualified (MGC 71%)
 
+**⚠ SUPERSEDED as of Aug 4 2026 — see "Validated Trade-Log Results" below.**
+A 546-trade export analyzed directly from `EvoD_Trader_TradeLog.pine`
+contradicts this table on two counts: MNQ shows a clear positive edge (not
+"NO EDGE"), and the day-of-week pattern is flat (not Monday-dead/
+Thursday-best). The table above is pre-rewrite MFE-touch data on a
+3.5-month 5-min window; the new results are exit-simulation data on 546
+trades across 11 months. Prefer the new numbers.
+
 ---
 
-## Account Context (Apex 25K Performance Account)
+## Validated Trade-Log Results (Aug 4 2026)
 
+First analysis run on real per-trade data rather than aggregate table stats.
+Source: `EvoD_Trader_TradeLog.pine` export, parsed and analyzed by
+`tools/analyze_tradelog.py`.
+
+**Config:** MNQ1!, 15-min, ORB (New York), N=0.25h, entry=6h, Scale exit,
+filter OFF. 546 trades over 228 trading days, Sept 2025 – Aug 2026.
+
+| | n | win% | avgW | avgL | expectancy | PF |
+|---|---|---|---|---|---|---|
+| ALL | 546 | 58.1% | +33.50 | −12.26 | +14.31 pts | 3.78 |
+| BOL | 287 | 60.3% | +34.36 | −12.84 | +15.61 pts | 4.06 |
+| BOS | 259 | 55.6% | +32.47 | −11.69 | +12.86 pts | 3.48 |
+
+Chronological: +7,812 pts total, max drawdown 115.69 pts, worst losing
+streak 7 trades.
+
+### `exit_reason` is a mechanism label, NOT an outcome label
+**135 of 363 `stop` exits (37%) are profitable**, worth +1,822 pts. Cause:
+Scale mode banks 1/3 at T1 then moves the stop to breakeven, so the
+remainder stopping out still nets positive. Any analysis that buckets by
+`exit_reason` instead of the sign of `pts` will read this strategy as a
+~30%-win-rate disaster. The Pine table was always correct (`curIsWin =
+curPts > 0`); this trap only bites downstream consumers of the log. Strongly
+suspected source of repeated misreadings in parallel analysis sessions.
+
+### Day-of-week edge is flat — retire the old filter
+Mon 57.3% / Tue 58.5% / Wed 63.1% / Thu 55.1% / Fri 56.0%. Within noise, and
+Thursday is now the *worst* day, directly inverting the pre-rewrite table's
+"Thursday best" claim. Do not filter by weekday on the old numbers.
+
+### Entry extension past the range edge does NOT predict outcome
+Bucketed by `entry_ext_pct` (0-25/25-50/50-100/100-200/200%+): win rates
+57/64/54/61/54%, non-monotonic. Hypothesis was that late/extended entries
+would underperform — they don't. No filter justified. (Extension is often
+large by construction: at N=0.25h the range is one 15-min pre-open bar, and
+the RTH-open bar routinely dwarfs it.)
+
+### Cost robustness
+Breakeven friction is 14.31 pts/trade ($28.62 round trip). At a realistic
+2–4 pts (commissions + a tick or two, times Scale mode's extra fills),
+PF stays 2.5–3.1 and expectancy +10 to +12 pts. Edge survives with margin.
+
+### Loss clustering is mild
+Win rate 54.4% after a loss vs 60.6% after a win. Block-bootstrap (resampling
+whole trading days, preserving intra-day clustering) vs IID bootstrap barely
+differ below 20 contracts; at 20 contracts clustering roughly doubles bust
+risk (1.6% → 3.7%).
+
+### ⚠ Two unmodeled risks — the results are optimistic until these are tested
+1. **Entry fills at the signal bar's close.** You only know the bar closed
+   beyond the range once it *has* closed, so that fill isn't achievable
+   live — realistically you fill at the next bar's open, which on a momentum
+   breakout is systematically worse. Not captured by the symmetric cost
+   sweep above.
+2. **"Breakeven" isn't free live.** Slippage turns many of the +0.00 exits
+   into small losses — and those exits are exactly what produces the
+   unusually smooth equity curve (68:1 return-to-drawdown, which is not what
+   real strategies look like).
+
+Fix for both: log the next bar's open alongside the close and re-run on
+realistic fills. Until then treat the numbers as an upper bound.
+
+---
+
+## Backtest Sample-Size & Session-Timing Notes (Aug 2026)
+
+Findings from reconciling a parallel Claude.ai analysis session against
+this script's actual logic. Mechanics below are verified directly against
+the code; specific win-rate/PF numbers from that session are not — treat
+those as a lead to re-verify, not a validated result.
+
+**TradingView's intraday calculation-bar limit is real but not precisely
+verifiable from this script.** TradingView caps how many historical bars a
+script can calculate over on intraday timeframes as a fixed *bar count*, so
+shorter timeframes cover less calendar history (a 5-min chart's usable
+lookback is shorter than a 15-min chart's). The parallel session's figures
+(~3.5 months on 5-min, ~11 months on 15-min) are directionally consistent
+with how this limit works, but the exact cutoff depends on plan tier and
+the specific instrument's data feed, and isn't something the script itself
+can report — check your own chart directly (scroll to the earliest bar
+that actually gets a signal, or watch `bar_index` at the leftmost loaded
+bar) rather than trusting a fixed number.
+
+**Confirmed: ORB + New York + N=0.25h session timing**, verified against
+MARKET/SESSION RESOLUTION ([EvoD_Trader_Range.pine:159-198](EvoD_Trader_Range.pine:159)):
+`rangeStartM = marketOpenM(570) - nMin(15) = 555` (9:15 ET),
+`rangeEndM = marketOpenM = 570` (9:30 ET), `entryStartM = rangeEndM = 570`.
+On a 15-min chart this window is exactly one bar (9:15–9:30) — both
+boundaries are multiples of 15 and align to the chart's bar grid, so this
+is deterministic, not a coincidence of this particular dataset. The range
+genuinely is a single pre-open bar's high/low, and the first entry-eligible
+bar (9:30–9:45) tests whether that bar's own OHLC breaks it — confirming
+the parallel session's read: *"did the first RTH bar break the last
+pre-market bar's high/low."* This does NOT generalize to every N/timeframe
+combination — if N isn't a multiple of the chart's bar size, or the
+market-open boundary doesn't land on the bar grid, the range could span a
+different or uneven number of bars.
+
+**Why the Range Quality Filter "destroys" signal count at very small N —
+structural, not a bug.** The filter compares `rangeHeight` against
+`entryAtrToday`, which snapshots `ta.atr(atrLen)` — computed over the
+*chart's own bars* ([EvoD_Trader_Range.pine:218](EvoD_Trader_Range.pine:218))
+— at the moment the entry window opens. On a 15-min chart, ATR14 reflects
+~3.5 hours of volatility. At N=0.25h, `rangeHeight` is just **one 15-min
+bar's** high-low span. A single bar's range being ≥1.5–2.0× a 14-bar ATR is
+structurally rare, so the filter is nearly incompatible with single-bar
+range windows by construction — not "too strict," just measuring the wrong
+thing at that N. When tuning N and the Filter together in a sweep, the
+filter multiplier needs to scale with N (or be off entirely at very small
+N), not stay fixed across every N tested.
+
+**On exporting bar data via Pine Logs for a Python sweep: reconsider
+before building this.** Two problems. First, a 1-min chart has *less*
+usable calculation history under TradingView's bar-count cap than the
+15-min chart already in use — exporting from 1-min bars shrinks the
+available window, it doesn't extend it. Second, Pine's log panel isn't
+built for bulk export — months of 1-min OHLCV is 100,000+ rows, far beyond
+what `log.info()`/the Pine Logs panel can hold or let you copy in one
+piece (see the existing CSV-export mechanism's own scale, which tops out at
+a ~25-row table, not raw bar data). A dedicated OHLCV source outside Pine
+entirely — a broker/data API, a data vendor, or Tradovate's own historical
+data — is a more direct path to a real Python sweep than round-tripping
+through Pine Logs.
+
+---
+
+## Account Context
+
+**Current: two Legacy 25K accounts**, each with a $1,500 trailing drawdown.
+- Daily loss limit: $200, enforced at the platform level in Tradovate (a
+  hard stop, not self-imposed)
+- Daily profit cap: $400 (consistency-rule protection)
+- Starting size: 3 MNQ micros — deliberately conservative
+- Prior **Apex 25K Performance Account** was blown via revenge trading; kept
+  below as historical reference for the risk-rule structure, not a live
+  account
+
+**Prior Apex 25K Performance Account (historical reference):**
 - Profit target: $26,600
 - Trailing drawdown: $1,000 EOD
 - Daily loss limit (self-imposed): $150
 - Daily profit cap (self-imposed): $300 (consistency rule: no day > 40% of total)
 - Max contracts: 1 MES mini / 10 micros
 - MGC fits larger accounts (Tradeify 150K) — stop too large for 25K
-- MNQ: proven negative edge, never trade
+- MNQ: "proven negative edge, never trade" — per the pre-rewrite Qualified
+  Instruments table above; see the Aug 2026 note there questioning this
+  under the new engine
 
 ---
 
