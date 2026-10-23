@@ -1,0 +1,367 @@
+//@version=6
+indicator("EvoD Trade Log — 1min resolution, N-min trigger, fixed TP/SL", overlay=true, max_bars_back=5000)
+
+// ============================================================
+// EvoD Trader — PER-TRADE CSV EXPORTER
+// RUN THIS ON A 1-MINUTE CHART.
+//
+// WHY THIS EXISTS
+// The 15-min version of this test was unusable: with TP=15 / SL=13, the
+// 28-point band was NARROWER than a typical 15-min bar (median range 42.5,
+// median ATR14 54.4). Result: 98.3% of trades resolved on their own entry
+// bar, and 76% of the "losses" were bars that touched BOTH the target and
+// the stop. OHLC can't say which came first, so the conservative tie-break
+// called every one of them a stop and the strategy looked like it lost
+// -6.42 pts/trade. That number measured the tie-break rule, not the edge.
+//
+// Fix: resolve on 1-minute bars, where a ~14pt typical bar range sits well
+// inside the 28pt TP/SL band, so most trades resolve across several bars
+// with unambiguous ordering. Residual same-bar ambiguity is COUNTED and
+// exported (see the `ambiguous` column) rather than hidden — if that rate
+// is still high, these results are still suspect and you'll know.
+//
+// STRUCTURE
+//   Range      built from wall-clock times (unchanged) — on a 1-min chart
+//              the default ORB/N=0.25h window is the 15 bars 09:15-09:29.
+//   Trigger    evaluated on N-minute blocks aggregated from 1-min bars
+//              (triggerMinutes, default 5) — NOT on every 1-min close.
+//              A block triggers if it OPENED inside the range and CLOSED
+//              outside it, same boundary-crossing rule as the 15-min model.
+//   Entry      the first 1-min bar of the NEXT block, at its open. This is
+//              genuinely fillable: the block's close is known before that
+//              bar opens.
+//   Exit       fixed TP/SL checked on every 1-min bar, entry bar included
+//              (you filled at its open, so the rest of it is live).
+//
+// No request.security() anywhere — blocks are aggregated manually from
+// chart bars. CLAUDE.md records an earlier MTF attempt via
+// request.security_lower_tf() that silently zeroed out signal counts and
+// was reverted; this avoids that whole class of problem by only ever
+// reading the chart's own bars.
+//
+// Analyze with: python tools/analyze_tradelog.py <exported.csv>
+// ============================================================
+
+// ------------------------------------------------------------
+// INPUTS
+// ------------------------------------------------------------
+startDate        = input.time(timestamp("2024-01-01 00:00:00"), "Start Date", group="Date Range")
+endDate          = input.time(timestamp("2027-01-01 00:00:00"), "End Date",   group="Date Range")
+
+rangeShape       = input.string("ORB", "Range Shape", options=["IB", "ORB", "EvoD ORB", "Futures Start 15min", "Futures Start IB", "Custom"], group="Preset")
+market           = input.string("New York", "Market", options=["New York", "London", "Tokyo"], group="Preset")
+nHours           = input.float(0.25, "N Hours (range measure)", minval=0.0166, step=0.0833, group="Preset",
+     tooltip="0.25 = a 15-minute range measure. On a 1-min chart that's 15 bars.")
+entryWindowHours = input.float(6.0, "Entry Window Duration (hours)", minval=0.5, step=0.5, group="Preset")
+
+triggerMinutes   = input.int(5, "Trigger block size (minutes)", minval=1, maxval=60, group="Preset",
+     tooltip="Breakout is evaluated on blocks this many minutes long, aggregated from 1-min bars. 5 = check for a break every 5 minutes; entry fills on the next 1-min bar's open. Set to 1 to evaluate every 1-min close.")
+
+tz               = input.string("America/Chicago", "TZ (Custom shape only)", options=["America/Chicago","America/New_York","America/Los_Angeles","Europe/London","UTC"], group="Session (Custom shape only)")
+rangeStartHM     = input.int(845,  "Range build START (HHMM)",  group="Session (Custom shape only)")
+rangeEndHM       = input.int(945,  "Range build END (HHMM)",    group="Session (Custom shape only)")
+entryStartHM     = input.int(945,  "Entry window START (HHMM)", group="Session (Custom shape only)")
+entryEndHM       = input.int(1030, "Entry window END (HHMM)",   group="Session (Custom shape only)")
+exitHM           = input.int(1200, "Timeout EXIT (HHMM)",       group="Session (Custom shape only)")
+
+tpPoints         = input.float(15.0, "Take Profit (points)", minval=0.25, step=0.25, group="Targets / Stops")
+slPoints         = input.float(13.0, "Stop Loss (points)",   minval=0.25, step=0.25, group="Targets / Stops")
+useFailureStop   = input.bool(false, "Also stop on close back inside range (after 2 blocks)", group="Targets / Stops",
+     tooltip="Off by default here so this measures pure fixed TP/SL. Turn on to A/B against the breakout-failure exit.")
+
+atrLen           = input.int(14, "ATR length (context only)", minval=1, group="Risk")
+
+useHolidays      = input.bool(true, "Exclude US holidays", group="Filters")
+minRangeATR      = input.float(0.0, "Range Quality Filter (x ATR at entry open, 0=off)", minval=0.0, step=0.1, group="Filters")
+
+enableBOL        = input.bool(true, "Enable BOL (Break Out Long)",  group="Signals")
+enableBOS        = input.bool(true, "Enable BOS (Break Out Short)", group="Signals")
+
+exportTrades     = input.bool(false, "Export trade log to Pine Logs (on last bar)", group="Export")
+rowsPerChunk     = input.int(25, "Rows per log entry", minval=1, maxval=200, group="Export")
+showDebugCount   = input.bool(true, "Show trade count on chart", group="Export")
+
+hm2min(hm) => math.floor(hm / 100) * 60 + (hm % 100)
+
+// ------------------------------------------------------------
+// HOLIDAY EXCLUSION
+// ------------------------------------------------------------
+_hm = month(time, tz)
+_hd = dayofmonth(time, tz)
+_hy = year(time, tz)
+isHol = useHolidays and (
+     (_hy==2025 and _hm==7  and _hd==4)  or (_hy==2025 and _hm==9  and _hd==1)  or
+     (_hy==2025 and _hm==11 and _hd==11) or (_hy==2025 and _hm==11 and _hd==27) or
+     (_hy==2025 and _hm==11 and _hd==28) or (_hy==2025 and _hm==12 and _hd==25) or
+     (_hy==2025 and _hm==12 and _hd==26) or (_hy==2026 and _hm==1  and _hd==1)  or
+     (_hy==2026 and _hm==1  and _hd==19) or (_hy==2026 and _hm==2  and _hd==16) or
+     (_hy==2026 and _hm==4  and _hd==3)  or (_hy==2026 and _hm==5  and _hd==25) or
+     (_hy==2026 and _hm==7  and _hd==3)  or (_hy==2026 and _hm==9  and _hd==7)  or
+     (_hy==2026 and _hm==11 and _hd==11) or (_hy==2026 and _hm==11 and _hd==26) or
+     (_hy==2026 and _hm==12 and _hd==25))
+
+// ------------------------------------------------------------
+// MARKET / SESSION RESOLUTION
+// ------------------------------------------------------------
+isCustom  = rangeShape == "Custom"
+isFutures = rangeShape == "Futures Start 15min" or rangeShape == "Futures Start IB"
+
+marketTz     = market == "New York" ? "America/New_York" : market == "London" ? "Europe/London" : "Asia/Tokyo"
+marketOpenHM = market == "New York" ? 930 : market == "London" ? 800 : 900
+effectiveTz  = isCustom ? tz : isFutures ? "America/Chicago" : marketTz
+
+barTimeMinutes = hour(time, effectiveTz) * 60 + minute(time, effectiveTz)
+
+marketOpenM = hm2min(marketOpenHM)
+cmeReopenM  = hm2min(1700)
+nMin        = math.round(nHours * 60)
+entryWinMin = math.round(entryWindowHours * 60)
+
+rangeStartM = isCustom ? hm2min(rangeStartHM) :
+     rangeShape == "IB"                  ? marketOpenM :
+     rangeShape == "ORB"                 ? marketOpenM - nMin :
+     rangeShape == "EvoD ORB"            ? marketOpenM + 15 - nMin :
+     rangeShape == "Futures Start 15min" ? cmeReopenM : cmeReopenM
+
+rangeEndM = isCustom ? hm2min(rangeEndHM) :
+     rangeShape == "IB"                  ? marketOpenM + nMin :
+     rangeShape == "ORB"                 ? marketOpenM :
+     rangeShape == "EvoD ORB"            ? marketOpenM + 15 :
+     rangeShape == "Futures Start 15min" ? cmeReopenM + 15 : cmeReopenM + nMin
+
+entryStartM = isCustom ? hm2min(entryStartHM) : rangeEndM
+entryEndM   = isCustom ? hm2min(entryEndHM)   : rangeEndM + entryWinMin
+exitM       = isCustom ? hm2min(exitHM)       : entryEndM
+
+inRange     = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM
+entryWindow = barTimeMinutes >= entryStartM and barTimeMinutes < entryEndM
+validDay    = time >= startDate and time <= endDate and not isHol
+
+dw = dayofweek(time, effectiveTz)
+dowNow = (dw == dayofweek.sunday or dw == dayofweek.monday) ? 0 : dw == dayofweek.tuesday ? 1 : dw == dayofweek.wednesday ? 2 : dw == dayofweek.thursday ? 3 : 4
+
+atr14 = ta.atr(atrLen)
+
+// ------------------------------------------------------------
+// RANGE CALCULATION (wall-clock driven, so it works on any chart TF)
+// ------------------------------------------------------------
+var float orHigh   = na
+var float orLow    = na
+var bool  rangeSet = false
+
+isFirstRangeBar = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM and (barTimeMinutes[1] < rangeStartM or barTimeMinutes[1] >= rangeEndM)
+
+if isFirstRangeBar
+    orHigh   := high
+    orLow    := low
+    rangeSet := false
+
+if inRange and not na(orHigh)
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow,  low)
+
+if barTimeMinutes >= rangeEndM and barTimeMinutes < entryEndM and barTimeMinutes[1] < rangeEndM
+    rangeSet := true
+
+rangeHeight = not na(orHigh) and not na(orLow) ? orHigh - orLow : na
+
+var float entryAtrToday = na
+if barTimeMinutes >= entryStartM and barTimeMinutes[1] < entryStartM
+    entryAtrToday := atr14
+rangeQualityOK = minRangeATR <= 0 or (not na(rangeHeight) and not na(entryAtrToday) and rangeHeight >= minRangeATR * entryAtrToday)
+
+// ------------------------------------------------------------
+// N-MINUTE TRIGGER BLOCKS, aggregated from 1-min bars.
+// A block is complete the moment a new one starts, so the trigger is
+// evaluated on the first bar of the next block — and that same bar's OPEN
+// is the fill. That ordering is what makes the fill realistic: the block's
+// close is already known when this bar opens.
+// ------------------------------------------------------------
+blockId    = math.floor(barTimeMinutes / triggerMinutes)
+isNewBlock = blockId != blockId[1]
+
+var float blkOpen      = na
+var float prevBlkOpen  = na
+var float prevBlkClose = na
+
+if isNewBlock
+    prevBlkOpen  := blkOpen
+    prevBlkClose := close[1]
+    blkOpen      := open
+
+// ------------------------------------------------------------
+// STATE
+// ------------------------------------------------------------
+var string[] tradeRows = array.new_string()
+
+var bool  tradeLive  = false
+var bool  curLong    = false
+var float curEntry   = na
+var float curSigPx   = na
+var float curStop    = na
+var float curTP      = na
+var float curMFE     = 0.0
+var float curMAE     = 0.0
+var int   curDow     = 0
+var int   curEbar    = na
+var int   curEtime   = na
+var float curRangeH  = na
+var float curAtrE    = na
+var float curEdge    = na
+var bool  curAmbig   = false   // did the resolving bar span BOTH tp and sl?
+
+if isFirstRangeBar
+    tradeLive := false
+
+// ------------------------------------------------------------
+// 1. RESOLUTION — every 1-min bar, entry bar included.
+// Same-bar TP+SL ties still resolve as a stop, but now they're rare AND
+// flagged, so the contamination rate is visible in the output instead of
+// silently driving the result.
+// ------------------------------------------------------------
+curPts = 0.0
+curResolved = false
+curExitReason = -1   // 0=stop 1=target 2=timeout 3=failure
+
+if tradeLive and validDay
+    favor   = curLong ? high - curEntry : curEntry - low
+    adverse = curLong ? curEntry - low  : high - curEntry
+    curMFE := math.max(curMFE, favor)
+    curMAE := math.max(curMAE, adverse)
+
+    hitTP = curLong ? high >= curTP  : low  <= curTP
+    hitSL = curLong ? low  <= curStop : high >= curStop
+    failStop = useFailureStop and bar_index > curEbar + triggerMinutes * 2 and (curLong ? close < orHigh : close > orLow)
+
+    if hitTP and hitSL
+        curAmbig := true
+        curPts := -slPoints
+        curResolved := true
+        curExitReason := 0
+    else if hitSL
+        curPts := -slPoints
+        curResolved := true
+        curExitReason := 0
+    else if hitTP
+        curPts := tpPoints
+        curResolved := true
+        curExitReason := 1
+    else if failStop
+        curPts := (close - curEntry) * (curLong ? 1 : -1)
+        curResolved := true
+        curExitReason := 3
+
+if barTimeMinutes >= exitM and barTimeMinutes[1] < exitM and tradeLive and validDay and not curResolved
+    curPts := (close - curEntry) * (curLong ? 1 : -1)
+    curResolved := true
+    curExitReason := 2
+
+// ------------------------------------------------------------
+// 2. RECORD
+// ------------------------------------------------------------
+if curResolved
+    tradeLive := false
+    slotNm = curLong ? "BOL" : "BOS"
+    dowNm  = curDow == 0 ? "Mon" : curDow == 1 ? "Tue" : curDow == 2 ? "Wed" : curDow == 3 ? "Thu" : "Fri"
+    reason = curExitReason == 0 ? "stop" : curExitReason == 1 ? "target" : curExitReason == 2 ? "timeout" : "failure"
+    extPct = curRangeH > 0 ? (curLong ? (curEntry - curEdge) : (curEdge - curEntry)) / curRangeH * 100 : na
+    slip   = (curLong ? (curEntry - curSigPx) : (curSigPx - curEntry))
+
+    row = str.tostring(array.size(tradeRows) + 1) + "," +
+         slotNm + "," +
+         (curLong ? "long" : "short") + "," +
+         str.format_time(curEtime, "yyyy-MM-dd", effectiveTz) + "," +
+         str.format_time(curEtime, "HH:mm", effectiveTz) + "," +
+         str.format_time(time,     "HH:mm", effectiveTz) + "," +
+         dowNm + "," +
+         str.tostring(curSigPx, "#.####") + "," +
+         str.tostring(curEntry, "#.####") + "," +
+         str.tostring(slip, "#.####") + "," +
+         str.tostring(curStop, "#.####") + "," +
+         str.tostring(curTP, "#.####") + "," +
+         str.tostring(extPct, "#.##") + "," +
+         reason + "," +
+         str.tostring(curPts, "#.####") + "," +
+         str.tostring(curMFE, "#.##") + "," +
+         str.tostring(curMAE, "#.##") + "," +
+         (curAmbig ? "1" : "0") + "," +
+         str.tostring(curRangeH, "#.####") + "," +
+         str.tostring(curAtrE, "#.####") + "," +
+         str.tostring(bar_index - curEbar)
+    array.push(tradeRows, row)
+
+// ------------------------------------------------------------
+// 3. TRIGGER + FILL — both on this bar, because the block that just closed
+// is complete and this bar's open is the first fillable price after it.
+// ------------------------------------------------------------
+canEnter = isNewBlock and rangeSet and entryWindow and validDay and not na(rangeHeight) and not tradeLive and rangeQualityOK and not na(prevBlkOpen)
+
+if canEnter
+    longTrig  = enableBOL and prevBlkOpen <= orHigh and prevBlkClose > orHigh
+    shortTrig = enableBOS and prevBlkOpen >= orLow  and prevBlkClose < orLow
+    if longTrig or shortTrig
+        tradeLive := true
+        curLong   := longTrig
+        curEntry  := open
+        curSigPx  := prevBlkClose
+        curStop   := longTrig ? open - slPoints : open + slPoints
+        curTP     := longTrig ? open + tpPoints : open - tpPoints
+        curMFE    := 0.0
+        curMAE    := 0.0
+        curAmbig  := false
+        curDow    := dowNow
+        curEbar   := bar_index
+        curEtime  := time
+        curRangeH := rangeHeight
+        curAtrE   := atr14
+        curEdge   := longTrig ? orHigh : orLow
+
+// ------------------------------------------------------------
+// EXPORT
+// ------------------------------------------------------------
+varip bool exportedOnce = false
+
+if barstate.islast and exportTrades and not exportedOnce
+    exportedOnce := true
+    n = array.size(tradeRows)
+
+    log.info("TRADELOG_BEGIN n=" + str.tostring(n) +
+         " symbol=" + syminfo.ticker +
+         " tf=" + timeframe.period +
+         " shape=" + rangeShape + (isFutures ? "" : "(" + market + ")") +
+         " N=" + str.tostring(nHours, "#.###") + "h" +
+         " trigblock=" + str.tostring(triggerMinutes) + "min" +
+         " entry=" + str.tostring(entryWindowHours, "#.##") + "h" +
+         " fill=next-bar-open" +
+         " tp=" + str.tostring(tpPoints, "#.##") +
+         " sl=" + str.tostring(slPoints, "#.##") +
+         " failstop=" + (useFailureStop ? "on" : "off") +
+         " filter=" + (minRangeATR <= 0 ? "off" : str.tostring(minRangeATR, "#.#") + "xATR") +
+         " range=" + str.format_time(startDate, "yyyy-MM-dd", effectiveTz) + ".." + str.format_time(endDate, "yyyy-MM-dd", effectiveTz))
+
+    log.info("idx,signal,dir,entry_date,entry_time,exit_time,dow,signal_px,entry_px,fill_slip,stop_px,tp_px,entry_ext_pct,exit_reason,pts,mfe_pts,mae_pts,ambiguous,range_pts,atr_pts,bars_held")
+
+    if n > 0
+        chunk = ""
+        cnt   = 0
+        for i = 0 to n - 1
+            chunk := chunk + array.get(tradeRows, i) + "\n"
+            cnt   += 1
+            if cnt >= rowsPerChunk
+                log.info(chunk)
+                chunk := ""
+                cnt   := 0
+        if cnt > 0
+            log.info(chunk)
+
+    log.info("TRADELOG_END n=" + str.tostring(n))
+
+if showDebugCount and barstate.islast
+    var label cntLbl = na
+    label.delete(cntLbl)
+    cntLbl := label.new(time, high, xloc=xloc.bar_time,
+         text=str.tostring(array.size(tradeRows)) + " trades  |  " + timeframe.period + "min chart"
+              + "\ntrigger " + str.tostring(triggerMinutes) + "min  TP " + str.tostring(tpPoints, "#.##") + " / SL " + str.tostring(slPoints, "#.##")
+              + (exportTrades ? "\n(check Pine Logs)" : "\n(enable Export to dump)"),
+         style=label.style_label_down,
+         color=color.new(color.navy, 20), textcolor=color.white, size=size.small)
