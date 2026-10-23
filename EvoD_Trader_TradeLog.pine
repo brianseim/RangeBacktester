@@ -1,0 +1,376 @@
+//@version=6
+indicator("EvoD Trader Trade Log (next-open fill, fixed TP/SL)", overlay=true, max_bars_back=5000)
+
+// ============================================================
+// EvoD Trader — PER-TRADE CSV EXPORTER
+// BOL/BOS, NEXT-BAR-OPEN fill, FIXED point TP/SL
+//
+// This is a deliberate departure from EvoD_Trader_Range.pine's model, built
+// to test a simpler and more realistically-fillable strategy:
+//
+//   1. ENTRY AT THE NEXT BAR'S OPEN, not the signal bar's close.
+//      The main indicator fills at the close of the bar that breaks the
+//      range — but you only *know* that bar closed beyond the range once it
+//      has closed, so that fill isn't achievable live. Here the signal arms
+//      on bar N's close and fills at bar N+1's open, which is. The log
+//      records both prices and the difference (fill_slip), so the cost of
+//      waiting is measured directly instead of assumed.
+//
+//   2. FIXED POINT TARGETS AND STOPS (default 15 / 13), replacing the
+//      range-relative 50/100/200% targets and the tighter-of-ATR-vs-quartile
+//      stop. One target, one stop, no scale-out, no breakeven move — so the
+//      three-stage state machine is gone entirely.
+//
+//      Note this changes the risk profile fundamentally: 15/13 is ~1.15:1,
+//      so breakeven win rate is 13/(15+13) = 46.4%. The old model's smooth
+//      equity curve came largely from the breakeven-stop mechanic, which no
+//      longer exists here — expect a very different (and more honest)
+//      drawdown profile.
+//
+//   3. THE ENTRY BAR IS NOW ELIGIBLE FOR RESOLUTION. Since the fill happens
+//      at that bar's open, the rest of the bar is real tradeable time and
+//      its high/low can legitimately hit the target or stop. The main
+//      indicator excludes the entry bar (it fills at the close, so there's
+//      no bar left). Same-bar TP+SL ties resolve as a STOP — OHLC can't tell
+//      you which came first, so the conservative read is taken.
+//
+// MFE/MAE are logged per trade so TP/SL levels can be re-tuned from this
+// data without re-running the export: mfe_pts is how far the trade ever went
+// your way, mae_pts how far against. If most winners show mfe far above 15,
+// the target is leaving money on the table; if most losers show mae barely
+// past 13, the stop is too tight.
+//
+// Add via Pine Editor, set Export=on, then read the Pine Logs panel.
+// Analyze with: python tools/analyze_tradelog.py <exported.csv>
+// ============================================================
+
+// ------------------------------------------------------------
+// INPUTS
+// ------------------------------------------------------------
+startDate        = input.time(timestamp("2024-01-01 00:00:00"), "Start Date", group="Date Range")
+endDate          = input.time(timestamp("2027-01-01 00:00:00"), "End Date",   group="Date Range")
+
+rangeShape       = input.string("ORB", "Range Shape", options=["IB", "ORB", "EvoD ORB", "Futures Start 15min", "Futures Start IB", "Custom"], group="Preset")
+market           = input.string("New York", "Market", options=["New York", "London", "Tokyo"], group="Preset")
+nHours           = input.float(0.25, "N Hours", minval=0.1, step=0.25, group="Preset")
+entryWindowHours = input.float(6.0, "Entry Window Duration (hours)", minval=0.5, step=0.5, group="Preset")
+
+tz               = input.string("America/Chicago", "TZ (Custom shape only)", options=["America/Chicago","America/New_York","America/Los_Angeles","Europe/London","UTC"], group="Session (Custom shape only)")
+rangeStartHM     = input.int(845,  "Range build START (HHMM)",  group="Session (Custom shape only)")
+rangeEndHM       = input.int(945,  "Range build END (HHMM)",    group="Session (Custom shape only)")
+entryStartHM     = input.int(945,  "Entry window START (HHMM)", group="Session (Custom shape only)")
+entryEndHM       = input.int(1030, "Entry window END (HHMM)",   group="Session (Custom shape only)")
+exitHM           = input.int(1200, "Timeout EXIT (HHMM)",       group="Session (Custom shape only)")
+
+// --- Fixed TP / SL (the core change) ---
+tpPoints         = input.float(15.0, "Take Profit (points)", minval=0.25, step=0.25, group="Targets / Stops",
+     tooltip="Fixed distance from entry. Replaces the old 50/100/200%-of-range targets.")
+slPoints         = input.float(13.0, "Stop Loss (points)",   minval=0.25, step=0.25, group="Targets / Stops",
+     tooltip="Fixed distance from entry. Replaces the tighter-of-ATR-vs-quartile stop.")
+useFailureStop   = input.bool(true, "Also stop on close back inside range (after 2 bars)", group="Targets / Stops",
+     tooltip="The breakout-failure exit carried over from the main indicator. With a tight fixed stop this fires less often, but it can still exit a dead breakout before the stop. Turn off to test pure fixed TP/SL.")
+
+atrLen           = input.int(14, "ATR length (context + Range Quality Filter only)", minval=1, group="Risk")
+
+useHolidays      = input.bool(true, "Exclude US holidays", group="Filters")
+minRangeATR      = input.float(0.0, "Range Quality Filter (x ATR14 at entry open, 0=off)", minval=0.0, step=0.1, group="Filters")
+
+enableBOL        = input.bool(true, "Enable BOL (Break Out Long)",  group="Signals")
+enableBOS        = input.bool(true, "Enable BOS (Break Out Short)", group="Signals")
+
+exportTrades     = input.bool(false, "Export trade log to Pine Logs (on last bar)", group="Export")
+rowsPerChunk     = input.int(25, "Rows per log entry", minval=1, maxval=200, group="Export",
+     tooltip="Pine caps single log.info() payload size. If entries look truncated mid-row, lower this.")
+showDebugCount   = input.bool(true, "Show trade count on chart", group="Export")
+
+hm2min(hm) => math.floor(hm / 100) * 60 + (hm % 100)
+
+// ------------------------------------------------------------
+// HOLIDAY EXCLUSION
+// ------------------------------------------------------------
+_hm = month(time, tz)
+_hd = dayofmonth(time, tz)
+_hy = year(time, tz)
+isHol = useHolidays and (
+     (_hy==2025 and _hm==7  and _hd==4)  or (_hy==2025 and _hm==9  and _hd==1)  or
+     (_hy==2025 and _hm==11 and _hd==11) or (_hy==2025 and _hm==11 and _hd==27) or
+     (_hy==2025 and _hm==11 and _hd==28) or (_hy==2025 and _hm==12 and _hd==25) or
+     (_hy==2025 and _hm==12 and _hd==26) or (_hy==2026 and _hm==1  and _hd==1)  or
+     (_hy==2026 and _hm==1  and _hd==19) or (_hy==2026 and _hm==2  and _hd==16) or
+     (_hy==2026 and _hm==4  and _hd==3)  or (_hy==2026 and _hm==5  and _hd==25) or
+     (_hy==2026 and _hm==7  and _hd==3)  or (_hy==2026 and _hm==9  and _hd==7)  or
+     (_hy==2026 and _hm==11 and _hd==11) or (_hy==2026 and _hm==11 and _hd==26) or
+     (_hy==2026 and _hm==12 and _hd==25))
+
+// ------------------------------------------------------------
+// MARKET / SESSION RESOLUTION
+// ------------------------------------------------------------
+isCustom  = rangeShape == "Custom"
+isFutures = rangeShape == "Futures Start 15min" or rangeShape == "Futures Start IB"
+
+marketTz     = market == "New York" ? "America/New_York" : market == "London" ? "Europe/London" : "Asia/Tokyo"
+marketOpenHM = market == "New York" ? 930 : market == "London" ? 800 : 900
+effectiveTz  = isCustom ? tz : isFutures ? "America/Chicago" : marketTz
+
+barTimeMinutes = hour(time, effectiveTz) * 60 + minute(time, effectiveTz)
+
+marketOpenM = hm2min(marketOpenHM)
+cmeReopenM  = hm2min(1700)
+nMin        = math.round(nHours * 60)
+entryWinMin = math.round(entryWindowHours * 60)
+
+rangeStartM = isCustom ? hm2min(rangeStartHM) :
+     rangeShape == "IB"                  ? marketOpenM :
+     rangeShape == "ORB"                 ? marketOpenM - nMin :
+     rangeShape == "EvoD ORB"            ? marketOpenM + 15 - nMin :
+     rangeShape == "Futures Start 15min" ? cmeReopenM : cmeReopenM
+
+rangeEndM = isCustom ? hm2min(rangeEndHM) :
+     rangeShape == "IB"                  ? marketOpenM + nMin :
+     rangeShape == "ORB"                 ? marketOpenM :
+     rangeShape == "EvoD ORB"            ? marketOpenM + 15 :
+     rangeShape == "Futures Start 15min" ? cmeReopenM + 15 : cmeReopenM + nMin
+
+entryStartM = isCustom ? hm2min(entryStartHM) : rangeEndM
+entryEndM   = isCustom ? hm2min(entryEndHM)   : rangeEndM + entryWinMin
+exitM       = isCustom ? hm2min(exitHM)       : entryEndM
+
+inRange     = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM
+entryWindow = barTimeMinutes >= entryStartM and barTimeMinutes < entryEndM
+validDay    = time >= startDate and time <= endDate and not isHol
+
+dw = dayofweek(time, effectiveTz)
+dowNow = (dw == dayofweek.sunday or dw == dayofweek.monday) ? 0 : dw == dayofweek.tuesday ? 1 : dw == dayofweek.wednesday ? 2 : dw == dayofweek.thursday ? 3 : 4
+
+atr14 = ta.atr(atrLen)
+
+// ------------------------------------------------------------
+// RANGE CALCULATION
+// ------------------------------------------------------------
+var float orHigh   = na
+var float orLow    = na
+var bool  rangeSet = false
+
+isFirstRangeBar = barTimeMinutes >= rangeStartM and barTimeMinutes < rangeEndM and (barTimeMinutes[1] < rangeStartM or barTimeMinutes[1] >= rangeEndM)
+
+if isFirstRangeBar
+    orHigh   := high
+    orLow    := low
+    rangeSet := false
+
+if inRange and not na(orHigh)
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow,  low)
+
+if barTimeMinutes >= rangeEndM and barTimeMinutes < entryEndM and barTimeMinutes[1] < rangeEndM
+    rangeSet := true
+
+rangeHeight = not na(orHigh) and not na(orLow) ? orHigh - orLow : na
+
+var float entryAtrToday = na
+if barTimeMinutes >= entryStartM and barTimeMinutes[1] < entryStartM
+    entryAtrToday := atr14
+rangeQualityOK = minRangeATR <= 0 or (not na(rangeHeight) and not na(entryAtrToday) and rangeHeight >= minRangeATR * entryAtrToday)
+
+// ------------------------------------------------------------
+// STATE
+// ------------------------------------------------------------
+var string[] tradeRows = array.new_string()
+
+// Pending entry — armed by a signal on bar N's close, filled on bar N+1's open
+var bool  pendArmed  = false
+var bool  pendLong   = false
+var float pendSigPx  = na    // signal bar's close (what the old model filled at)
+var float pendEdge   = na    // range edge broken
+var float pendRangeH = na
+var float pendAtr    = na
+
+var bool  tradeLive  = false
+var bool  curLong    = false
+var float curEntry   = na
+var float curSigPx   = na
+var float curStop    = na
+var float curTP      = na
+var float curMFE     = 0.0
+var float curMAE     = 0.0
+var int   curDow     = 0
+var int   curEbar    = na
+var int   curEtime   = na
+var int   curStime   = na
+var float curRangeH  = na
+var float curAtrE    = na
+var float curEdge    = na
+
+if isFirstRangeBar
+    tradeLive := false
+    pendArmed := false
+
+// ------------------------------------------------------------
+// 1. FILL PENDING ENTRY at THIS bar's open
+// Runs before resolution so the entry bar itself is live for TP/SL.
+// Cancels if the window closed or the day went invalid between the signal
+// bar and this one.
+// ------------------------------------------------------------
+if pendArmed and not tradeLive
+    if entryWindow and validDay and rangeSet
+        tradeLive := true
+        curLong   := pendLong
+        curEntry  := open
+        curSigPx  := pendSigPx
+        curStop   := pendLong ? open - slPoints : open + slPoints
+        curTP     := pendLong ? open + tpPoints : open - tpPoints
+        curMFE    := 0.0
+        curMAE    := 0.0
+        curDow    := dowNow
+        curEbar   := bar_index
+        curEtime  := time
+        curRangeH := pendRangeH
+        curAtrE   := pendAtr
+        curEdge   := pendEdge
+    pendArmed := false
+
+// ------------------------------------------------------------
+// 2. RESOLUTION — single fixed TP / SL. Entry bar included (see header).
+// Same-bar TP+SL tie resolves as a stop.
+// ------------------------------------------------------------
+curPts = 0.0
+curResolved = false
+curExitReason = -1   // 0=stop 1=target 2=timeout 3=failure
+
+if tradeLive and validDay
+    // MFE/MAE in points, for re-tuning TP/SL from the log later
+    favor  = curLong ? high - curEntry : curEntry - low
+    adverse = curLong ? curEntry - low : high - curEntry
+    curMFE := math.max(curMFE, favor)
+    curMAE := math.max(curMAE, adverse)
+
+    hitTP = curLong ? high >= curTP : low <= curTP
+    hitSL = curLong ? low <= curStop : high >= curStop
+    failStop = useFailureStop and bar_index > curEbar + 1 and (curLong ? close < orHigh : close > orLow)
+
+    if hitSL
+        curPts := -slPoints
+        curResolved := true
+        curExitReason := 0
+    else if hitTP
+        curPts := tpPoints
+        curResolved := true
+        curExitReason := 1
+    else if failStop
+        curPts := (close - curEntry) * (curLong ? 1 : -1)
+        curResolved := true
+        curExitReason := 3
+
+// Timeout at the end of the entry window
+if barTimeMinutes >= exitM and barTimeMinutes[1] < exitM and tradeLive and validDay and not curResolved
+    curPts := (close - curEntry) * (curLong ? 1 : -1)
+    curResolved := true
+    curExitReason := 2
+
+// ------------------------------------------------------------
+// 3. RECORD
+// ------------------------------------------------------------
+if curResolved
+    tradeLive := false
+    slotNm = curLong ? "BOL" : "BOS"
+    dowNm  = curDow == 0 ? "Mon" : curDow == 1 ? "Tue" : curDow == 2 ? "Wed" : curDow == 3 ? "Thu" : "Fri"
+    reason = curExitReason == 0 ? "stop" : curExitReason == 1 ? "target" : curExitReason == 2 ? "timeout" : "failure"
+    extPct = curRangeH > 0 ? (curLong ? (curEntry - curEdge) : (curEdge - curEntry)) / curRangeH * 100 : na
+    // Positive fill_slip = the next-open fill was WORSE than the signal
+    // bar's close, i.e. what waiting for a realistic fill actually cost.
+    slip = (curLong ? (curEntry - curSigPx) : (curSigPx - curEntry))
+
+    row = str.tostring(array.size(tradeRows) + 1) + "," +
+         slotNm + "," +
+         (curLong ? "long" : "short") + "," +
+         str.format_time(curEtime, "yyyy-MM-dd", effectiveTz) + "," +
+         str.format_time(curStime, "HH:mm", effectiveTz) + "," +
+         str.format_time(curEtime, "HH:mm", effectiveTz) + "," +
+         str.format_time(time,     "HH:mm", effectiveTz) + "," +
+         dowNm + "," +
+         str.tostring(curSigPx, "#.####") + "," +
+         str.tostring(curEntry, "#.####") + "," +
+         str.tostring(slip, "#.####") + "," +
+         str.tostring(curStop, "#.####") + "," +
+         str.tostring(curTP, "#.####") + "," +
+         str.tostring(extPct, "#.##") + "," +
+         reason + "," +
+         str.tostring(curPts, "#.####") + "," +
+         str.tostring(curMFE, "#.##") + "," +
+         str.tostring(curMAE, "#.##") + "," +
+         str.tostring(curRangeH, "#.####") + "," +
+         str.tostring(curAtrE, "#.####") + "," +
+         str.tostring(bar_index - curEbar)
+    array.push(tradeRows, row)
+
+// ------------------------------------------------------------
+// 4. ARM NEXT-BAR ENTRY on this bar's close
+// ------------------------------------------------------------
+canArm = rangeSet and entryWindow and validDay and not na(rangeHeight) and not tradeLive and not pendArmed and rangeQualityOK
+
+if canArm
+    if enableBOL and open <= orHigh and close > orHigh
+        pendArmed  := true
+        pendLong   := true
+        pendSigPx  := close
+        pendEdge   := orHigh
+        pendRangeH := rangeHeight
+        pendAtr    := atr14
+        curStime   := time
+    else if enableBOS and open >= orLow and close < orLow
+        pendArmed  := true
+        pendLong   := false
+        pendSigPx  := close
+        pendEdge   := orLow
+        pendRangeH := rangeHeight
+        pendAtr    := atr14
+        curStime   := time
+
+// ------------------------------------------------------------
+// EXPORT — varip latch survives realtime tick re-evaluation of the last bar
+// ------------------------------------------------------------
+varip bool exportedOnce = false
+
+if barstate.islast and exportTrades and not exportedOnce
+    exportedOnce := true
+    n = array.size(tradeRows)
+
+    log.info("TRADELOG_BEGIN n=" + str.tostring(n) +
+         " symbol=" + syminfo.ticker +
+         " tf=" + timeframe.period +
+         " shape=" + rangeShape + (isFutures ? "" : "(" + market + ")") +
+         " N=" + str.tostring(nHours, "#.##") + "h" +
+         " entry=" + str.tostring(entryWindowHours, "#.##") + "h" +
+         " fill=next-open" +
+         " tp=" + str.tostring(tpPoints, "#.##") +
+         " sl=" + str.tostring(slPoints, "#.##") +
+         " failstop=" + (useFailureStop ? "on" : "off") +
+         " filter=" + (minRangeATR <= 0 ? "off" : str.tostring(minRangeATR, "#.#") + "xATR") +
+         " range=" + str.format_time(startDate, "yyyy-MM-dd", effectiveTz) + ".." + str.format_time(endDate, "yyyy-MM-dd", effectiveTz))
+
+    log.info("idx,signal,dir,entry_date,signal_time,entry_time,exit_time,dow,signal_px,entry_px,fill_slip,stop_px,tp_px,entry_ext_pct,exit_reason,pts,mfe_pts,mae_pts,range_pts,atr_pts,bars_held")
+
+    if n > 0
+        chunk = ""
+        cnt   = 0
+        for i = 0 to n - 1
+            chunk := chunk + array.get(tradeRows, i) + "\n"
+            cnt   += 1
+            if cnt >= rowsPerChunk
+                log.info(chunk)
+                chunk := ""
+                cnt   := 0
+        if cnt > 0
+            log.info(chunk)
+
+    log.info("TRADELOG_END n=" + str.tostring(n))
+
+if showDebugCount and barstate.islast
+    var label cntLbl = na
+    label.delete(cntLbl)
+    cntLbl := label.new(time, high, xloc=xloc.bar_time,
+         text=str.tostring(array.size(tradeRows)) + " trades logged"
+              + "\nTP " + str.tostring(tpPoints, "#.##") + " / SL " + str.tostring(slPoints, "#.##")
+              + (exportTrades ? "\n(check Pine Logs)" : "\n(enable Export to dump)"),
+         style=label.style_label_down,
+         color=color.new(color.navy, 20), textcolor=color.white, size=size.small)

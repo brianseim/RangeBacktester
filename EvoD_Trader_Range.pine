@@ -97,6 +97,24 @@ mnqContracts     = input.int(1, "MNQ contracts (for $ expectancy column)", minva
 exportToLog      = input.bool(false, "Export table to Pine Logs (CSV, on last bar)", group="Export",
      tooltip="Writes the full table as CSV to the Pine Logs panel (bottom panel, next to Strategy Tester) so you can select/copy it — e.g. to paste into an AI chat. Pine can't touch the system clipboard or write files directly, so this is the closest thing to a real export.")
 
+// --- Webhook / Tradovate ---
+// Pine can't talk to Tradovate directly — Tradovate has no Pine-equivalent
+// scripting layer of its own, it's an execution/order platform. The bridge
+// is: TradingView alert fires -> webhook posts this JSON -> a Tradovate-
+// connected bot/automation service (not part of this script) parses it and
+// places the order. When off, alerts keep sending the original human-
+// readable text unchanged.
+webhookMode      = input.bool(false, "Send JSON webhook payloads (for Tradovate/automation bots)", group="Webhook / Tradovate",
+     tooltip="On: alert messages become JSON ({\"signal\":...,\"action\":\"buy/sell\",...}) for a webhook-driven bot.\nOff: alerts stay human-readable text.")
+webhookSymbol    = input.string("", "Symbol override for payload (blank = chart ticker)", group="Webhook / Tradovate",
+     tooltip="Leave blank to use syminfo.ticker. Set this if your Tradovate account's contract code differs from the TradingView ticker (e.g. continuous vs. dated futures symbol).")
+webhookQty       = input.int(1, "Order qty in payload", minval=1, group="Webhook / Tradovate")
+
+// Pure function (no global mutation) — builds the JSON message body shared
+// by every signal's webhook alert.
+buildWebhookMsg(sig, side, sym, qty, entryP, stopP, t1P, t2P, t3P) =>
+    "{\"signal\":\"" + sig + "\",\"action\":\"" + side + "\",\"symbol\":\"" + sym + "\",\"qty\":" + str.tostring(qty) + ",\"entry\":" + str.tostring(entryP,"#.##") + ",\"stop\":" + str.tostring(stopP,"#.##") + ",\"t1\":" + str.tostring(t1P,"#.##") + ",\"t2\":" + str.tostring(t2P,"#.##") + ",\"t3\":" + str.tostring(t3P,"#.##") + "}"
+
 // Convert HHMM inputs to minutes-since-midnight
 hm2min(hm) => math.floor(hm / 100) * 60 + (hm % 100)
 
@@ -528,10 +546,20 @@ if tradeLive and validDay and bar_index > curEbar
             curH3 := true
 
     dirSign = curLong ? 1 : -1
+    // Failure confirmation (BOL/BOS only): a breakout is expected to hold
+    // beyond the range edge it broke through. If it hasn't by 2 bars after
+    // entry, a close back inside the range counts as a stop-out too — on
+    // top of, not instead of, the ATR/quartile stop (curStopCur). This is
+    // what lets FAL/FAS arm off a breakout that quietly failed without ever
+    // tagging the (often much wider) ATR/quartile stop. Not applied to the
+    // other 10 signals — MID/wick entries are already on the "inside" side
+    // of their trigger level by construction, so "back inside the range"
+    // isn't a failure signal for them the way it is for a breakout.
+    failureConfirm = (curSlot == 0 or curSlot == 1) and bar_index > curEbar + 1 and (curLong ? close < orHigh : close > orLow)
     if exitMode == "Scale"
         if curStage == 0
             hitT = curLong ? high >= curT1 : low <= curT1
-            hitS = curLong ? close < curStopCur : close > curStopCur
+            hitS = (curLong ? close < curStopCur : close > curStopCur) or failureConfirm
             if hitT and hitS
                 curPts := (curStopCur - curEntry) * dirSign
                 curResolved := true
@@ -546,7 +574,7 @@ if tradeLive and validDay and bar_index > curEbar
                 curExitReason := 0
         else if curStage == 1
             hitT = curLong ? high >= curT2 : low <= curT2
-            hitS = curLong ? close < curStopCur : close > curStopCur
+            hitS = (curLong ? close < curStopCur : close > curStopCur) or failureConfirm
             if hitT and hitS
                 curPts := curRealized + (curStopCur - curEntry) * dirSign * (2.0/3)
                 curResolved := true
@@ -560,7 +588,7 @@ if tradeLive and validDay and bar_index > curEbar
                 curExitReason := 0
         else
             hitT = curLong ? high >= curT3 : low <= curT3
-            hitS = curLong ? close < curStopCur : close > curStopCur
+            hitS = (curLong ? close < curStopCur : close > curStopCur) or failureConfirm
             if hitT and hitS
                 curPts := curRealized + (curStopCur - curEntry) * dirSign * (1.0/3)
                 curResolved := true
@@ -576,7 +604,7 @@ if tradeLive and validDay and bar_index > curEbar
     else
         tgt = exitMode == "Full@50" ? curT1 : curT2
         hitT = curLong ? high >= tgt : low <= tgt
-        hitS = curLong ? close < curStopCur : close > curStopCur
+        hitS = (curLong ? close < curStopCur : close > curStopCur) or failureConfirm
         if hitT and hitS
             curPts := (curStopCur - curEntry) * dirSign
             curResolved := true
@@ -706,7 +734,9 @@ if canEnter
         if show_labels
             label.new(time, low, xloc=xloc.bar_time, text="BOL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.green,20), textcolor=color.white, size=size.small)
         if alert_bo
-            alert("BOL breakout entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("BOL", "buy", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "BOL breakout entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
     else if enableBOS and open >= orLow and close < orLow
         tradeLive  := true
         curSlot    := 1
@@ -731,7 +761,9 @@ if canEnter
         if show_labels
             label.new(time, high, xloc=xloc.bar_time, text="BOS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.red,20), textcolor=color.white, size=size.small)
         if alert_bo
-            alert("BOS breakout entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("BOS", "sell", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "BOS breakout entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 // ------------------------------------------------------------
 // FAL / FAS — after a BOL/BOS stop-out, watch the opposite edge
@@ -763,7 +795,9 @@ if canEnter and fa_armed and not fa_done
         if show_labels
             label.new(time, high, xloc=xloc.bar_time, text="FAS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.fuchsia,20), textcolor=color.white, size=size.small)
         if alert_fa
-            alert("FAS reversal entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("FAS", "sell", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "FAS reversal entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
     else if (not fa_longFail) and enableFAL and open <= orHigh and close > orHigh
         fa_done    := true
         tradeLive  := true
@@ -789,7 +823,9 @@ if canEnter and fa_armed and not fa_done
         if show_labels
             label.new(time, low, xloc=xloc.bar_time, text="FAL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.fuchsia,20), textcolor=color.white, size=size.small)
         if alert_fa
-            alert("FAL reversal entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("FAL", "buy", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "FAL reversal entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 // ------------------------------------------------------------
 // MIDL / MIDS — cross of the mid-range line, edge-triggered
@@ -822,7 +858,9 @@ if canEnter and not na(mid)
         if show_labels
             label.new(time, low, xloc=xloc.bar_time, text="MIDL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.teal,20), textcolor=color.white, size=size.small)
         if alert_mid
-            alert("MIDL cross entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("MIDL", "buy", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "MIDL cross entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
     else if enableMIDS and crossedDown
         tradeLive  := true
         curSlot    := 5
@@ -847,7 +885,9 @@ if canEnter and not na(mid)
         if show_labels
             label.new(time, high, xloc=xloc.bar_time, text="MIDS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.teal,20), textcolor=color.white, size=size.small)
         if alert_mid
-            alert("MIDS cross entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("MIDS", "sell", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "MIDS cross entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 // ------------------------------------------------------------
 // WICK-REJECTION CONFIRMATIONS (checked first — using flags set on the
@@ -881,7 +921,9 @@ if canEnter and pendWHL and enableWHL
         if show_labels
             label.new(time, low, xloc=xloc.bar_time, text="WHL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.lime,20), textcolor=color.white, size=size.small)
         if alert_wick
-            alert("WHL confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("WHL", "buy", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "WHL confirm entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 if canEnter and pendWHS and enableWHS
     if close < pendWHS_lo
@@ -907,7 +949,9 @@ if canEnter and pendWHS and enableWHS
         if show_labels
             label.new(time, high, xloc=xloc.bar_time, text="WHS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.red,20), textcolor=color.white, size=size.small)
         if alert_wick
-            alert("WHS confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("WHS", "sell", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "WHS confirm entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 if canEnter and pendWLL and enableWLL
     if close > pendWLL_hi
@@ -933,7 +977,9 @@ if canEnter and pendWLL and enableWLL
         if show_labels
             label.new(time, low, xloc=xloc.bar_time, text="WLL\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.green,20), textcolor=color.white, size=size.small)
         if alert_wick
-            alert("WLL confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("WLL", "buy", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "WLL confirm entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 if canEnter and pendWLS and enableWLS
     if close < pendWLS_lo
@@ -959,7 +1005,9 @@ if canEnter and pendWLS and enableWLS
         if show_labels
             label.new(time, high, xloc=xloc.bar_time, text="WLS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.maroon,20), textcolor=color.white, size=size.small)
         if alert_wick
-            alert("WLS confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("WLS", "sell", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "WLS confirm entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 if canEnter and pendWML and enableWML
     if close > pendWML_hi
@@ -985,7 +1033,9 @@ if canEnter and pendWML and enableWML
         if show_labels
             label.new(time, low, xloc=xloc.bar_time, text="WML\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_up, color=color.new(color.teal,20), textcolor=color.white, size=size.small)
         if alert_wick
-            alert("WML confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("WML", "buy", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "WML confirm entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 if canEnter and pendWMS and enableWMS
     if close < pendWMS_lo
@@ -1011,7 +1061,9 @@ if canEnter and pendWMS and enableWMS
         if show_labels
             label.new(time, high, xloc=xloc.bar_time, text="WMS\n" + str.tostring(close, "#.##") + "\nST:" + str.tostring(stopDist, "#.##") + "pts / " + str.tostring(ticks, "#") + "t", style=label.style_label_down, color=color.new(color.orange,20), textcolor=color.white, size=size.small)
         if alert_wick
-            alert("WMS confirm entry @ " + str.tostring(close), alert.freq_once_per_bar_close)
+            wsym = webhookSymbol == "" ? syminfo.ticker : webhookSymbol
+            msg  = webhookMode ? buildWebhookMsg("WMS", "sell", wsym, webhookQty, close, curStopCur, curT1, curT2, curT3) : "WMS confirm entry @ " + str.tostring(close)
+            alert(msg, alert.freq_once_per_bar_close)
 
 // Pending candidates are one-shot: clear regardless of outcome once checked
 pendWHL := false

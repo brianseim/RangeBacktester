@@ -142,6 +142,33 @@ MIDL, MIDS, WHL, WHS, WLL, WLS, WML, WMS).
 **Exit Simulation:** Exit Mode (Scale/Full@100/Full@50), MNQ contracts (for
 $ expectancy).
 
+**Webhook / Tradovate:** optional JSON payload mode for every entry alert
+(`{"signal":"BOL","action":"buy","symbol":"...","qty":1,"entry":...,"stop":...,
+"t1":...,"t2":...,"t3":...}`), for a webhook-driven bot to place orders on
+Tradovate — TradingView alert → webhook → your bot → Tradovate API. Off by
+default (plain-text alerts). Tradovate itself has no Pine-equivalent
+scripting layer, so this indicator can't run natively there; it stays the
+signal source, Tradovate stays the execution venue.
+
+## Other Platforms
+
+| File | Platform | Status |
+|---|---|---|
+| `EvoD_Trader_Range.pine` | TradingView (Pine v6) | Source of truth |
+| `EvoD_BOL_Strategy_TOS.ts` | ThinkOrSwim (thinkScript, Strategy not Study) | BOL signal only — see note below |
+
+**ThinkOrSwim:** ported as a thinkScript *Strategy* (`AddOrder`-based), not a
+Study — thinkScript Studies have no native trade/P&L concept and no arrays,
+so hand-rolling the full 12-signal engine + stats table the way Pine does
+would mean duplicating a full accumulator set 12 times by hand. A Strategy
+sidesteps that: ToS's built-in Strategy Report (right-click chart → Show
+Report once it's added under the Strategies tab, not Studies) computes win
+rate/P&L/drawdown/equity curve natively from the simulated fills. Currently
+BOL (Break Out Long) only, run unmodified across MNQ/MES/MGC/MCL/M2K/MYM to
+compare edge per instrument — session math assumes Market = New York only
+(no London/Tokyo), and it hasn't been run against a live ToS chart, so treat
+it as a first draft to verify the same way the Pine engine was.
+
 ---
 
 ## Disclaimer

@@ -1,0 +1,149 @@
+//@version=6
+indicator("EvoD OHLCV Export (Pine Logs CSV)", overlay=true, max_bars_back=5000)
+
+// ============================================================
+// RAW OHLCV EXPORTER — dumps chart bars as CSV to the Pine Logs panel.
+//
+// ⚠ READ THIS BEFORE PLANNING A BIG EXPORT
+//
+// This CANNOT produce a year of 1-minute data, and no setting here changes
+// that. TradingView caps how many historical bars a script may calculate
+// over as a fixed BAR COUNT (~20,000 on Premium — check your own tier).
+// On 1-minute bars with a 23/5 futures schedule:
+//
+//     1,380 bars/day  ->  ~14.5 days per export
+//     ~29,900 bars/month, ~348,000 bars/year
+//
+// A year is ~25x the cap. Bar Replay does NOT help: replay steps through
+// bars that are already loaded, it does not extend how far back the script
+// can calculate. Pointing replay at an earlier date just slides the same
+// ~20k-bar window backward — which does mean you can chunk manually, at
+// roughly 25 exports per symbol-year.
+//
+// For real bulk history (a year x several symbols), buy it instead:
+// FirstRate Data, Databento, Norgate, or possibly your Tradovate account's
+// API. Note that the CME "non-display" licensing fee applies to REAL-TIME
+// data — historical bars are a separate, much cheaper purchase.
+//
+// WHAT THIS IS ACTUALLY GOOD FOR
+//   - Pulling a specific 1-3 week window at 1-min for a targeted test
+//   - Grabbing a particular event window (a CPI day, a volatile stretch)
+//   - Spot-checking a vendor dataset against TradingView's own bars
+//
+// USAGE
+//   1. Set "Count only" = true first. It reports how many rows you'd emit
+//      without flooding the log. Check that number is sane.
+//   2. Narrow Start/End Date and (optionally) the time-of-day filter until
+//      the count is manageable.
+//   3. Set "Count only" = false, read the Pine Logs panel, export its CSV.
+//   4. Parse with tools/parse_ohlcv.py
+// ============================================================
+
+// ------------------------------------------------------------
+// INPUTS
+// ------------------------------------------------------------
+countOnly    = input.bool(true, "Count only (report row count, don't dump)", group="Export",
+     tooltip="Always run this first. Emitting tens of thousands of rows into the log panel with no idea of the volume just truncates silently.")
+
+startDate    = input.time(timestamp("2026-07-01 00:00:00"), "Start Date", group="Export")
+endDate      = input.time(timestamp("2026-08-01 00:00:00"), "End Date",   group="Export")
+
+useTimeFilter = input.bool(false, "Limit to a time-of-day window", group="Export",
+     tooltip="Cuts LOG volume, not the bar-count cap — the script still calculates over every chart bar, so this does not extend how far back you can reach. Useful when you only care about, say, the RTH session.")
+fromHM       = input.int(830,  "From (HHMM)", group="Export")
+toHM         = input.int(1600, "To (HHMM)",   group="Export")
+tz           = input.string("America/New_York", "Timezone for timestamps + filter",
+     options=["America/New_York","America/Chicago","America/Los_Angeles","Europe/London","UTC"], group="Export")
+
+includeVolume = input.bool(true, "Include volume column", group="Export")
+rowsPerChunk  = input.int(100, "Rows per log entry", minval=10, maxval=500, group="Export",
+     tooltip="Pine caps single log.info() payload size and the exact limit isn't documented. 100 rows of OHLCV is roughly 5KB. If log entries look truncated mid-row, lower this.")
+
+// ------------------------------------------------------------
+// FILTERING
+// ------------------------------------------------------------
+hm2min(hm) => math.floor(hm / 100) * 60 + (hm % 100)
+
+barMin  = hour(time, tz) * 60 + minute(time, tz)
+inClock = not useTimeFilter or (barMin >= hm2min(fromHM) and barMin < hm2min(toHM))
+inDates = time >= startDate and time <= endDate
+wanted  = inDates and inClock
+
+// ------------------------------------------------------------
+// BUFFER
+// Rows are batched into chunk-sized strings as they're built, rather than
+// stored one-per-array-slot — keeps the array small (a few hundred entries
+// instead of tens of thousands) and does the concatenation incrementally
+// instead of all at once on the final bar.
+// ------------------------------------------------------------
+var string[] chunks   = array.new_string()
+var string   pending  = ""
+var int      pendCnt  = 0
+var int      totalRows = 0
+
+if wanted
+    totalRows += 1
+    if not countOnly
+        row = str.format_time(time, "yyyy-MM-dd HH:mm", tz) + "," +
+             str.tostring(open,  format.mintick) + "," +
+             str.tostring(high,  format.mintick) + "," +
+             str.tostring(low,   format.mintick) + "," +
+             str.tostring(close, format.mintick) +
+             (includeVolume ? "," + str.tostring(volume, "#") : "")
+        pending := pending + row + "\n"
+        pendCnt += 1
+        if pendCnt >= rowsPerChunk
+            array.push(chunks, pending)
+            pending := ""
+            pendCnt := 0
+
+// ------------------------------------------------------------
+// EMIT — varip latch so realtime ticks on the forming last bar don't
+// re-dump the entire buffer on every tick (plain `var` does not survive
+// intra-bar re-evaluation; learned the hard way on the other exporters).
+// ------------------------------------------------------------
+varip bool emitted = false
+
+if barstate.islast and not emitted
+    emitted := true
+
+    // Flush whatever didn't fill a final chunk
+    if not countOnly and pendCnt > 0
+        array.push(chunks, pending)
+
+    est_kb = totalRows * (includeVolume ? 52 : 45) / 1024.0
+
+    log.info("OHLCV_BEGIN rows=" + str.tostring(totalRows) +
+         " symbol=" + syminfo.ticker +
+         " tf=" + timeframe.period +
+         " tz=" + tz +
+         " est_size=" + str.tostring(est_kb, "#.#") + "KB" +
+         " range=" + str.format_time(startDate, "yyyy-MM-dd", tz) + ".." + str.format_time(endDate, "yyyy-MM-dd", tz) +
+         (useTimeFilter ? " clock=" + str.tostring(fromHM) + "-" + str.tostring(toHM) : " clock=all") +
+         (countOnly ? "  [COUNT ONLY — no rows emitted]" : ""))
+
+    if countOnly
+        log.info("Set 'Count only' = false to dump these " + str.tostring(totalRows) +
+             " rows (~" + str.tostring(est_kb, "#.#") + "KB, " +
+             str.tostring(math.ceil(totalRows / rowsPerChunk)) + " log entries).")
+    else
+        log.info("timestamp,open,high,low,close" + (includeVolume ? ",volume" : ""))
+        if array.size(chunks) > 0
+            for i = 0 to array.size(chunks) - 1
+                log.info(array.get(chunks, i))
+        log.info("OHLCV_END rows=" + str.tostring(totalRows))
+
+// ------------------------------------------------------------
+// On-chart status — so you can see the row count without opening the panel
+// ------------------------------------------------------------
+if barstate.islast
+    var label lbl = na
+    label.delete(lbl)
+    lbl := label.new(time, high, xloc=xloc.bar_time,
+         text=str.tostring(totalRows) + " rows in range"
+              + "\n" + syminfo.ticker + " @ " + timeframe.period + "min"
+              + "\n~" + str.tostring(totalRows * (includeVolume ? 52 : 45) / 1024.0, "#.#") + "KB"
+              + (countOnly ? "\n[COUNT ONLY]" : "\n[dumping to Pine Logs]"),
+         style=label.style_label_down,
+         color=color.new(countOnly ? color.gray : color.teal, 20),
+         textcolor=color.white, size=size.small)
