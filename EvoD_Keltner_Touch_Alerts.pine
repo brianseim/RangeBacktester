@@ -1,0 +1,132 @@
+//@version=6
+indicator(title="EvoD Trader Tim Vesh inspired Keltner Channels", shorttitle="EvoD KC", overlay=true)
+
+// ── Keltner inputs (unchanged from the stock TradingView script) ───────────
+length = input.int(13, minval=1)
+multA = input.float(3.0, "Multiplier — inner", minval=0.1, step=0.1)
+multB = input.float(4.0, "Multiplier — outer", minval=0.1, step=0.1)
+src = input(close, title="Source")
+exp = input(true, "Use Exponential MA", display = display.none)
+BandsStyle = input.string("Average True Range", options = ["Average True Range", "True Range", "Range"], title="Bands Style", display = display.none)
+atrlength = input(10, "ATR Length", display = display.none)
+
+// ── Touch-alert inputs ────────────────────────────────────────────────────
+grpA = "Touch Alerts"
+touchMode = input.string("Wick (high/low)", options = ["Wick (high/low)", "Close"], title = "Touch definition", group = grpA, tooltip = "Wick = the bar's high/low reaches the band. Close = only the close counts.")
+tolPct    = input.float(0.0, "Tolerance (% of band width)", minval = 0.0, maxval = 100.0, step = 0.5, group = grpA, tooltip = "0 = exact touch. 5 = counts as a touch once price is within 5% of that band's own basis-to-band distance.")
+reArm     = input.bool(true, "First touch only (re-arm after price leaves the band)", group = grpA, tooltip = "Off = fires on every bar price is still against the band.")
+showMarks = input.bool(true, "Mark touches on chart", group = grpA)
+useDynAlert = input.bool(false, "Also fire alert() with a dynamic message", group = grpA, tooltip = "Lets one alert set to \"Any alert() function call\" cover all four bands and include the actual band price.")
+
+// ── Bands ─────────────────────────────────────────────────────────────────
+esma(source, length)=>
+	s = ta.sma(source, length)
+	e = ta.ema(source, length)
+	exp ? e : s
+ma = esma(src, length)
+rangema = BandsStyle == "True Range" ? ta.tr(true) : BandsStyle == "Average True Range" ? ta.atr(atrlength) : ta.rma(high - low, length)
+
+// Sorted so "inner"/"outer" stay truthful no matter which way round the two
+// multiplier inputs are typed.
+multIn  = math.min(multA, multB)
+multOut = math.max(multA, multB)
+
+upperIn  = ma + rangema * multIn
+lowerIn  = ma - rangema * multIn
+upperOut = ma + rangema * multOut
+lowerOut = ma - rangema * multOut
+colUp = #F23645
+colDn = #089981
+colBasis = #FFEB3B
+
+// Outer bands: solid.
+uOut = plot(upperOut, color=colUp, title="Upper outer")
+lOut = plot(lowerOut, color=colDn, title="Lower outer")
+
+plot(ma, color=colBasis, title="Basis")
+
+// Inner bands dashed. plot() gained a linestyle argument in Sept 2025; before
+// that the dash could only be picked by hand in Settings > Style, which is
+// why this used to be faked with a gapped series. Setting it here means a
+// freshly added instance comes up dashed with no manual styling.
+uIn = plot(upperIn, color=colUp, title="Upper inner", linestyle=plot.linestyle_dashed)
+lIn = plot(lowerIn, color=colDn, title="Lower inner", linestyle=plot.linestyle_dashed)
+
+// Inner channel is intentionally unfilled; only the outer zones are shaded.
+fill(uOut, uIn, color=color.new(colUp, 90), title="Upper channel")
+fill(lIn, lOut, color=color.new(colDn, 90), title="Lower channel")
+
+// ── Touch detection ───────────────────────────────────────────────────────
+// Tolerance is a fraction of each band's own basis-to-band distance, so it
+// scales with volatility and is proportionally the same on both bands.
+tolIn  = rangema * multIn  * tolPct / 100.0
+tolOut = rangema * multOut * tolPct / 100.0
+
+upRef = touchMode == "Close" ? close : high
+loRef = touchMode == "Close" ? close : low
+
+rawUpIn  = upRef >= upperIn  - tolIn
+rawUpOut = upRef >= upperOut - tolOut
+rawLoIn  = loRef <= lowerIn  + tolIn
+rawLoOut = loRef <= lowerOut + tolOut
+
+// Armed state persists across bars; each flag is updated AFTER the firing
+// decision so the first touching bar of a run is the one that alerts.
+// Declared one per line — Pine v6 drops all but the first in a comma list.
+var bool armUpIn = true
+var bool armUpOut = true
+var bool armLoIn = true
+var bool armLoOut = true
+
+upInTouch  = rawUpIn  and (not reArm or armUpIn)
+upOutTouch = rawUpOut and (not reArm or armUpOut)
+loInTouch  = rawLoIn  and (not reArm or armLoIn)
+loOutTouch = rawLoOut and (not reArm or armLoOut)
+
+if rawUpIn
+    armUpIn := false
+else
+    armUpIn := true
+
+if rawUpOut
+    armUpOut := false
+else
+    armUpOut := true
+
+if rawLoIn
+    armLoIn := false
+else
+    armLoIn := true
+
+if rawLoOut
+    armLoOut := false
+else
+    armLoOut := true
+
+// ── Visuals ───────────────────────────────────────────────────────────────
+// Outer touches get the hollow marker so a bar that tagged both reads as the
+// stronger event at a glance.
+plotshape(showMarks and upInTouch  and not upOutTouch, title="Inner upper touch", style=shape.triangledown, location=location.abovebar, color=colUp,  size=size.tiny)
+plotshape(showMarks and upOutTouch, title="Outer upper touch", style=shape.diamond, location=location.abovebar, color=colUp, size=size.tiny)
+plotshape(showMarks and loInTouch  and not loOutTouch, title="Inner lower touch", style=shape.triangleup, location=location.belowbar, color=colDn,  size=size.tiny)
+plotshape(showMarks and loOutTouch, title="Outer lower touch", style=shape.diamond, location=location.belowbar, color=colDn, size=size.tiny)
+
+// ── Alerts ────────────────────────────────────────────────────────────────
+// alertcondition() must sit at global scope — these show up as separate
+// pickable conditions in TradingView's alert dialog.
+alertcondition(upInTouch,  title="KC — Inner upper touched", message="{{ticker}} {{interval}} touched the INNER UPPER Keltner band. Price {{close}}")
+alertcondition(loInTouch,  title="KC — Inner lower touched", message="{{ticker}} {{interval}} touched the INNER LOWER Keltner band. Price {{close}}")
+alertcondition(upOutTouch, title="KC — Outer upper touched", message="{{ticker}} {{interval}} touched the OUTER UPPER Keltner band. Price {{close}}")
+alertcondition(loOutTouch, title="KC — Outer lower touched", message="{{ticker}} {{interval}} touched the OUTER LOWER Keltner band. Price {{close}}")
+alertcondition(upOutTouch or loOutTouch, title="KC — Either outer band touched", message="{{ticker}} {{interval}} touched an OUTER Keltner band. Price {{close}}")
+alertcondition(upInTouch or loInTouch or upOutTouch or loOutTouch, title="KC — Any band touched", message="{{ticker}} {{interval}} touched a Keltner band. Price {{close}}")
+
+if useDynAlert and upOutTouch
+    alert("KC OUTER UPPER (" + str.tostring(multOut) + "x) touched on " + syminfo.ticker + " @ " + str.tostring(upperOut, format.mintick) + " (price " + str.tostring(close, format.mintick) + ")", alert.freq_once_per_bar_close)
+else if useDynAlert and upInTouch
+    alert("KC INNER UPPER (" + str.tostring(multIn) + "x) touched on " + syminfo.ticker + " @ " + str.tostring(upperIn, format.mintick) + " (price " + str.tostring(close, format.mintick) + ")", alert.freq_once_per_bar_close)
+
+if useDynAlert and loOutTouch
+    alert("KC OUTER LOWER (" + str.tostring(multOut) + "x) touched on " + syminfo.ticker + " @ " + str.tostring(lowerOut, format.mintick) + " (price " + str.tostring(close, format.mintick) + ")", alert.freq_once_per_bar_close)
+else if useDynAlert and loInTouch
+    alert("KC INNER LOWER (" + str.tostring(multIn) + "x) touched on " + syminfo.ticker + " @ " + str.tostring(lowerIn, format.mintick) + " (price " + str.tostring(close, format.mintick) + ")", alert.freq_once_per_bar_close)
